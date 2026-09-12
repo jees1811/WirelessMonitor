@@ -1,6 +1,10 @@
 package com.wirelessmonitor
 
-import android.app.*
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
@@ -13,11 +17,13 @@ import android.os.IBinder
 import android.view.Surface
 import java.io.DataOutputStream
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ScreenCaptureService : Service() {
 
     companion object {
+
         const val EXTRA_RESULT_CODE =
             "result_code"
 
@@ -39,6 +45,9 @@ class ScreenCaptureService : Service() {
 
         private const val BITRATE =
             12_000_000
+
+        private const val PACKET_CONFIG = 0
+        private const val PACKET_FRAME = 1
     }
 
     private var mediaProjection:
@@ -63,6 +72,7 @@ class ScreenCaptureService : Service() {
         AtomicBoolean(false)
 
     override fun onCreate() {
+
         super.onCreate()
 
         createNotificationChannel()
@@ -75,7 +85,9 @@ class ScreenCaptureService : Service() {
     ): Int {
 
         if (intent == null) {
+
             stopSelf()
+
             return START_NOT_STICKY
         }
 
@@ -102,6 +114,7 @@ class ScreenCaptureService : Service() {
         ) {
 
             stopSelf()
+
             return START_NOT_STICKY
         }
 
@@ -111,11 +124,13 @@ class ScreenCaptureService : Service() {
         )
 
         Thread {
+
             startStreaming(
                 resultCode,
                 projectionData,
                 receiverIp
             )
+
         }.start()
 
         return START_NOT_STICKY
@@ -174,9 +189,15 @@ class ScreenCaptureService : Service() {
                 HEIGHT
             )
 
+        /*
+         * IMPORTANT:
+         *
+         * COLOR_FormatSurface tells MediaCodec
+         * that our input is the Surface created below.
+         */
         format.setInteger(
             MediaFormat.KEY_COLOR_FORMAT,
-            MediaCodec.CONFIGURE_FLAG_ENCODE
+            2130708361
         )
 
         format.setInteger(
@@ -232,6 +253,8 @@ class ScreenCaptureService : Service() {
         val info =
             MediaCodec.BufferInfo()
 
+        var configurationSent = false
+
         while (running.get()) {
 
             val index =
@@ -240,56 +263,163 @@ class ScreenCaptureService : Service() {
                     10_000
                 )
 
-            if (index >= 0) {
-
-                val buffer =
-                    codec.getOutputBuffer(index)
-
-                if (
-                    buffer != null &&
-                    info.size > 0
-                ) {
-
-                    buffer.position(info.offset)
-                    buffer.limit(
-                        info.offset + info.size
-                    )
-
-                    val data =
-                        ByteArray(info.size)
-
-                    buffer.get(data)
-
-                    synchronized(this) {
-
-                        output?.writeInt(
-                            data.size
-                        )
-
-                        output?.writeInt(
-                            info.flags
-                        )
-
-                        output?.write(
-                            data
-                        )
-
-                        output?.flush()
-                    }
-                }
-
-                codec.releaseOutputBuffer(
-                    index,
-                    false
-                )
-
-            } else if (
+            if (
                 index ==
                 MediaCodec.INFO_OUTPUT_FORMAT_CHANGED
             ) {
-                // Encoder format becomes available here.
-                // The decoder can receive H.264 stream data.
+
+                val format =
+                    codec.outputFormat
+
+                val sps =
+                    format.getByteBuffer(
+                        "csd-0"
+                    )
+
+                val pps =
+                    format.getByteBuffer(
+                        "csd-1"
+                    )
+
+                if (
+                    sps != null &&
+                    pps != null &&
+                    !configurationSent
+                ) {
+
+                    sendConfiguration(
+                        sps,
+                        pps
+                    )
+
+                    configurationSent = true
+                }
+
+                continue
             }
+
+            if (index < 0) {
+                continue
+            }
+
+            val buffer =
+                codec.getOutputBuffer(index)
+
+            if (
+                buffer != null &&
+                info.size > 0 &&
+                configurationSent
+            ) {
+
+                buffer.position(info.offset)
+
+                buffer.limit(
+                    info.offset + info.size
+                )
+
+                val data =
+                    ByteArray(info.size)
+
+                buffer.get(data)
+
+                sendFrame(
+                    data,
+                    info.flags,
+                    info.presentationTimeUs
+                )
+            }
+
+            codec.releaseOutputBuffer(
+                index,
+                false
+            )
+        }
+    }
+
+    private fun sendConfiguration(
+        spsBuffer: ByteBuffer,
+        ppsBuffer: ByteBuffer
+    ) {
+
+        val sps =
+            ByteArray(
+                spsBuffer.remaining()
+            )
+
+        spsBuffer.get(sps)
+
+        val pps =
+            ByteArray(
+                ppsBuffer.remaining()
+            )
+
+        ppsBuffer.get(pps)
+
+        synchronized(this) {
+
+            output?.writeInt(
+                PACKET_CONFIG
+            )
+
+            val totalSize =
+                4 +
+                        sps.size +
+                        4 +
+                        pps.size
+
+            output?.writeInt(
+                totalSize
+            )
+
+            output?.writeInt(
+                sps.size
+            )
+
+            output?.write(
+                sps
+            )
+
+            output?.writeInt(
+                pps.size
+            )
+
+            output?.write(
+                pps
+            )
+
+            output?.flush()
+        }
+    }
+
+    private fun sendFrame(
+        data: ByteArray,
+        flags: Int,
+        presentationTimeUs: Long
+    ) {
+
+        synchronized(this) {
+
+            output?.writeInt(
+                PACKET_FRAME
+            )
+
+            output?.writeInt(
+                data.size
+            )
+
+            output?.writeInt(
+                flags
+            )
+
+            output?.writeLong(
+                presentationTimeUs
+            )
+
+            output?.write(
+                data
+            )
+
+            output?.flush()
         }
     }
 
@@ -343,7 +473,9 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
+
         stopStreaming()
+
         super.onDestroy()
     }
 
