@@ -7,6 +7,7 @@ import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 class VideoReceiver(
@@ -15,8 +16,11 @@ class VideoReceiver(
 
     companion object {
         private const val PORT = 5000
-        private const val WIDTH = 1280
-        private const val HEIGHT = 720
+
+        private const val PACKET_CONFIG = 0
+        private const val PACKET_FRAME = 1
+
+        private const val MAX_PACKET_SIZE = 8 * 1024 * 1024
     }
 
     private var serverSocket: ServerSocket? = null
@@ -28,6 +32,7 @@ class VideoReceiver(
     private var worker: Thread? = null
 
     fun start() {
+
         if (running.get()) return
 
         running.set(true)
@@ -40,13 +45,14 @@ class VideoReceiver(
     }
 
     private fun runReceiver() {
+
         try {
+
             serverSocket = ServerSocket(PORT)
 
             socket = serverSocket!!.accept()
 
             socket!!.tcpNoDelay = true
-            socket!!.receiveBufferSize = 1024 * 1024
 
             val input =
                 DataInputStream(
@@ -56,21 +62,102 @@ class VideoReceiver(
                     )
                 )
 
-            decoder = MediaCodec.createDecoderByType(
-                MediaFormat.MIMETYPE_VIDEO_AVC
-            )
+            /*
+             * First packet must contain codec configuration.
+             */
+            val packetType =
+                input.readInt()
 
+            if (packetType != PACKET_CONFIG) {
+                throw Exception(
+                    "Expected H.264 configuration"
+                )
+            }
+
+            val configSize =
+                input.readInt()
+
+            if (
+                configSize <= 0 ||
+                configSize > MAX_PACKET_SIZE
+            ) {
+                throw Exception(
+                    "Invalid codec configuration"
+                )
+            }
+
+            val config =
+                ByteArray(configSize)
+
+            input.readFully(config)
+
+            /*
+             * Configuration format:
+             *
+             * first 4 bytes = SPS length
+             * next SPS bytes = SPS
+             * next 4 bytes = PPS length
+             * next PPS bytes = PPS
+             */
+            val configBuffer =
+                ByteBuffer.wrap(config)
+
+            val spsLength =
+                configBuffer.int
+
+            if (
+                spsLength <= 0 ||
+                spsLength > configBuffer.remaining()
+            ) {
+                throw Exception("Invalid SPS")
+            }
+
+            val sps =
+                ByteArray(spsLength)
+
+            configBuffer.get(sps)
+
+            val ppsLength =
+                configBuffer.int
+
+            if (
+                ppsLength <= 0 ||
+                ppsLength > configBuffer.remaining()
+            ) {
+                throw Exception("Invalid PPS")
+            }
+
+            val pps =
+                ByteArray(ppsLength)
+
+            configBuffer.get(pps)
+
+            /*
+             * We use the actual stream dimensions sent
+             * by the current first version:
+             * 1280 × 720.
+             */
             val format =
                 MediaFormat.createVideoFormat(
                     MediaFormat.MIMETYPE_VIDEO_AVC,
-                    WIDTH,
-                    HEIGHT
+                    1280,
+                    720
                 )
 
-            format.setInteger(
-                MediaFormat.KEY_MAX_INPUT_SIZE,
-                2 * 1024 * 1024
+            format.setByteBuffer(
+                "csd-0",
+                ByteBuffer.wrap(sps)
             )
+
+            format.setByteBuffer(
+                "csd-1",
+                ByteBuffer.wrap(pps)
+            )
+
+            decoder =
+                MediaCodec.createDecoderByType(
+                    MediaFormat.MIMETYPE_VIDEO_AVC
+                )
 
             decoder!!.configure(
                 format,
@@ -81,74 +168,114 @@ class VideoReceiver(
 
             decoder!!.start()
 
-            val bufferInfo = MediaCodec.BufferInfo()
+            receiveFrames(input)
 
-            while (running.get()) {
+        } catch (_: Exception) {
 
-                val size = input.readInt()
+            // Connection ended or receiver stopped.
 
-                if (size <= 0 || size > 4 * 1024 * 1024) {
-                    break
-                }
+        } finally {
 
-                val flags = input.readInt()
+            cleanup()
+        }
+    }
 
-                val data = ByteArray(size)
+    private fun receiveFrames(
+        input: DataInputStream
+    ) {
 
-                input.readFully(data)
+        val codec =
+            decoder ?: return
 
-                val codec = decoder ?: break
+        val bufferInfo =
+            MediaCodec.BufferInfo()
 
-                val inputIndex =
-                    codec.dequeueInputBuffer(10_000)
+        while (running.get()) {
 
-                if (inputIndex >= 0) {
+            val packetType =
+                input.readInt()
 
-                    val inputBuffer =
-                        codec.getInputBuffer(inputIndex)
+            if (
+                packetType != PACKET_FRAME
+            ) {
+                break
+            }
 
-                    inputBuffer?.clear()
-                    inputBuffer?.put(data)
+            val size =
+                input.readInt()
+
+            val flags =
+                input.readInt()
+
+            val presentationTimeUs =
+                input.readLong()
+
+            if (
+                size <= 0 ||
+                size > MAX_PACKET_SIZE
+            ) {
+                break
+            }
+
+            val data =
+                ByteArray(size)
+
+            input.readFully(data)
+
+            val inputIndex =
+                codec.dequeueInputBuffer(
+                    10_000
+                )
+
+            if (inputIndex >= 0) {
+
+                val inputBuffer =
+                    codec.getInputBuffer(
+                        inputIndex
+                    )
+
+                if (inputBuffer != null) {
+
+                    inputBuffer.clear()
+
+                    inputBuffer.put(data)
 
                     codec.queueInputBuffer(
                         inputIndex,
                         0,
                         data.size,
-                        System.nanoTime() / 1000,
+                        presentationTimeUs,
                         flags
                     )
                 }
+            }
 
-                var outputIndex =
+            var outputIndex =
+                codec.dequeueOutputBuffer(
+                    bufferInfo,
+                    0
+                )
+
+            while (outputIndex >= 0) {
+
+                codec.releaseOutputBuffer(
+                    outputIndex,
+                    true
+                )
+
+                outputIndex =
                     codec.dequeueOutputBuffer(
                         bufferInfo,
                         0
                     )
-
-                while (outputIndex >= 0) {
-
-                    codec.releaseOutputBuffer(
-                        outputIndex,
-                        true
-                    )
-
-                    outputIndex =
-                        codec.dequeueOutputBuffer(
-                            bufferInfo,
-                            0
-                        )
-                }
             }
-
-        } catch (_: Exception) {
-            // Connection closed or receiver stopped.
-        } finally {
-            cleanup()
         }
     }
 
     fun stop() {
+
         running.set(false)
+
         cleanup()
     }
 
