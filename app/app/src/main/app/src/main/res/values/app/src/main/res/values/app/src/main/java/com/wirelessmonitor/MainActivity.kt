@@ -2,6 +2,7 @@ package com.wirelessmonitor
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.widget.Button
@@ -22,32 +23,42 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         requestedOrientation =
-            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(40, 40, 40, 40)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(40, 40, 40, 40)
+        }
 
-        val title = TextView(this)
-        title.text = "Wireless Monitor"
-        title.textSize = 28f
+        val title = TextView(this).apply {
+            text = "Wireless Monitor"
+            textSize = 28f
+        }
 
-        val description = TextView(this)
-        description.text =
-            "\nOnePlus 13 → OnePlus Pad 2\n\n" +
-            "Choose Sender on the OnePlus 13.\n" +
-            "Choose Receiver on the Pad 2."
+        val description = TextView(this).apply {
+            text = """
+                
+                OnePlus 13 → OnePlus Pad 2
+                
+                Use START RECEIVER on the Pad 2.
+                Use START SENDER on the OnePlus 13.
+            """.trimIndent()
+            textSize = 18f
+        }
 
-        val senderButton = Button(this)
-        senderButton.text = "START SENDER (OnePlus 13)"
+        val senderButton = Button(this).apply {
+            text = "START SENDER"
+        }
 
-        ipInput = EditText(this)
-        ipInput.hint = "Pad 2 IP address"
-        ipInput.inputType =
-            android.text.InputType.TYPE_CLASS_PHONE
+        ipInput = EditText(this).apply {
+            hint = "Pad 2 IP address"
+            inputType =
+                android.text.InputType.TYPE_CLASS_TEXT
+        }
 
-        val receiverButton = Button(this)
-        receiverButton.text = "START RECEIVER (Pad 2)"
+        val receiverButton = Button(this).apply {
+            text = "START RECEIVER"
+        }
 
         root.addView(title)
         root.addView(description)
@@ -62,24 +73,48 @@ class MainActivity : Activity() {
         }
 
         receiverButton.setOnClickListener {
-            startReceiver()
+            try {
+                startActivity(
+                    Intent(
+                        this,
+                        ReceiverActivity::class.java
+                    )
+                )
+            } catch (e: Exception) {
+                Toast.makeText(
+                    this,
+                    "Receiver error: ${e.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
     }
 
     private fun requestScreenCapture() {
-        val manager =
-            getSystemService(MEDIA_PROJECTION_SERVICE)
-                    as MediaProjectionManager
 
-        val intent = manager.createScreenCaptureIntent()
+        try {
 
-        startActivityForResult(
-            intent,
-            SCREEN_CAPTURE_REQUEST
-        )
+            val manager =
+                getSystemService(
+                    MEDIA_PROJECTION_SERVICE
+                ) as MediaProjectionManager
+
+            startActivityForResult(
+                manager.createScreenCaptureIntent(),
+                SCREEN_CAPTURE_REQUEST
+            )
+
+        } catch (e: Exception) {
+
+            Toast.makeText(
+                this,
+                "Screen capture error: ${e.message}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
-    @Deprecated("Deprecated Android API used for broad compatibility")
+    @Deprecated("Compatibility with older Android versions")
     override fun onActivityResult(
         requestCode: Int,
         resultCode: Int,
@@ -91,22 +126,45 @@ class MainActivity : Activity() {
             data
         )
 
-        if (requestCode == SCREEN_CAPTURE_REQUEST) {
+        if (requestCode != SCREEN_CAPTURE_REQUEST) {
+            return
+        }
 
-            if (resultCode != RESULT_OK || data == null) {
-                Toast.makeText(
-                    this,
-                    "Screen capture permission was not granted.",
-                    Toast.LENGTH_LONG
-                ).show()
-                return
-            }
+        if (
+            resultCode != RESULT_OK ||
+            data == null
+        ) {
+            Toast.makeText(
+                this,
+                "Screen capture permission denied.",
+                Toast.LENGTH_LONG
+            ).show()
+
+            return
+        }
+
+        val ip =
+            ipInput.text.toString().trim()
+
+        if (ip.isEmpty()) {
+
+            Toast.makeText(
+                this,
+                "Enter the Pad 2 IP address first.",
+                Toast.LENGTH_LONG
+            ).show()
+
+            return
+        }
+
+        try {
 
             val serviceIntent =
                 Intent(
                     this,
                     ScreenCaptureService::class.java
                 ).apply {
+
                     putExtra(
                         ScreenCaptureService.EXTRA_RESULT_CODE,
                         resultCode
@@ -119,27 +177,27 @@ class MainActivity : Activity() {
 
                     putExtra(
                         ScreenCaptureService.EXTRA_RECEIVER_IP,
-                        ipInput.text.toString().trim()
+                        ip
                     )
                 }
 
-            startForegroundService(serviceIntent)
+            startForegroundService(
+                serviceIntent
+            )
 
             Toast.makeText(
                 this,
                 "Sender started.",
                 Toast.LENGTH_SHORT
             ).show()
-        }
-    }
 
-    private fun startReceiver() {
-        val intent =
-            Intent(
+        } catch (e: Exception) {
+
+            Toast.makeText(
                 this,
-                ReceiverActivity::class.java
-            )
-
-        startActivity(intent)
+                "Sender error: ${e.message}",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 }
