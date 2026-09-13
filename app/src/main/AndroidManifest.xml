@@ -14,11 +14,16 @@
         android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
 
     <application
+        android:name=".WirelessMonitorApp"
         android:allowBackup="false"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.WirelessMonitor"
         android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".CrashActivity"
+            android:exported="false" />
 
         <activity
             android:name=".ReceiverActivity"
