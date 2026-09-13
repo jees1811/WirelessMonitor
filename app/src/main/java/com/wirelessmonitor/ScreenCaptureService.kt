@@ -5,16 +5,20 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.Context
 import android.content.Intent
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.IBinder
+import android.util.DisplayMetrics
+import android.view.Display
 import android.view.Surface
+import android.view.WindowManager
 import java.io.DataOutputStream
 import java.net.Socket
 import java.nio.ByteBuffer
@@ -38,13 +42,17 @@ class ScreenCaptureService : Service() {
 
         private const val PORT = 5000
 
-        private const val WIDTH = 1280
-        private const val HEIGHT = 720
+        // The longest edge of the captured video is capped here
+        // to keep bandwidth/encoder load sane over Wi-Fi. The
+        // OnePlus 13's real aspect ratio is always preserved -
+        // we no longer force a fixed 1280x720 (16:9) buffer,
+        // which used to squash/stretch the image.
+        private const val MAX_DIMENSION = 1920
 
         private const val FPS = 60
 
         private const val BITRATE =
-            12_000_000
+            16_000_000
 
         private const val PACKET_CONFIG = 0
         private const val PACKET_FRAME = 1
@@ -67,6 +75,9 @@ class ScreenCaptureService : Service() {
 
     private var output:
             DataOutputStream? = null
+
+    private var captureWidth = 0
+    private var captureHeight = 0
 
     private val running =
         AtomicBoolean(false)
@@ -180,13 +191,74 @@ class ScreenCaptureService : Service() {
         }
     }
 
+    /**
+     * Reads the OnePlus 13's actual current screen resolution
+     * (in its current, landscape-forced orientation) so the
+     * captured video keeps the phone's real aspect ratio,
+     * scaled down only if it exceeds MAX_DIMENSION.
+     */
+    private fun computeCaptureSize(): Pair<Int, Int> {
+
+        var width: Int
+        var height: Int
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+
+            val windowManager =
+                getSystemService(WINDOW_SERVICE) as WindowManager
+
+            val bounds: Rect =
+                windowManager.currentWindowMetrics.bounds
+
+            width = bounds.width()
+            height = bounds.height()
+
+        } else {
+
+            val displayManager =
+                getSystemService(DISPLAY_SERVICE) as DisplayManager
+
+            val display =
+                displayManager.getDisplay(Display.DEFAULT_DISPLAY)
+
+            val metrics = DisplayMetrics()
+
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
+
+            width = metrics.widthPixels
+            height = metrics.heightPixels
+        }
+
+        val longestEdge = maxOf(width, height)
+
+        if (longestEdge > MAX_DIMENSION) {
+
+            val scale = MAX_DIMENSION.toFloat() / longestEdge
+
+            width = (width * scale).toInt()
+            height = (height * scale).toInt()
+        }
+
+        // H.264 encoders require even dimensions.
+        width -= width % 2
+        height -= height % 2
+
+        return Pair(width, height)
+    }
+
     private fun setupEncoder() {
+
+        val (width, height) = computeCaptureSize()
+
+        captureWidth = width
+        captureHeight = height
 
         val format =
             MediaFormat.createVideoFormat(
                 MediaFormat.MIMETYPE_VIDEO_AVC,
-                WIDTH,
-                HEIGHT
+                captureWidth,
+                captureHeight
             )
 
         /*
@@ -235,8 +307,8 @@ class ScreenCaptureService : Service() {
         virtualDisplay =
             mediaProjection!!.createVirtualDisplay(
                 "WirelessMonitor",
-                WIDTH,
-                HEIGHT,
+                captureWidth,
+                captureHeight,
                 320,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 inputSurface,
@@ -359,6 +431,17 @@ class ScreenCaptureService : Service() {
 
             output?.writeInt(
                 PACKET_CONFIG
+            )
+
+            // The receiver needs the real capture resolution
+            // to configure its decoder and to crop-fill the
+            // Pad's screen correctly.
+            output?.writeInt(
+                captureWidth
+            )
+
+            output?.writeInt(
+                captureHeight
             )
 
             val totalSize =
