@@ -17,7 +17,9 @@ class ReceiverActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         hideSystemBars()
 
         videoView = VideoReceiverView(this)
@@ -34,22 +36,32 @@ class ReceiverActivity : Activity() {
         )
 
         setContentView(root)
+
         videoView.start()
+
+        NsdHelper.registerService(this, VideoReceiver.PORT)
     }
 
     private fun hideSystemBars() {
         window.insetsController?.let { controller ->
-            controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-            controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(
+                WindowInsets.Type.statusBars() or
+                        WindowInsets.Type.navigationBars()
+            )
+            controller.systemBarsBehavior =
+                WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus) {
+            hideSystemBars()
+        }
     }
 
     override fun onDestroy() {
+        NsdHelper.unregisterService(this)
         videoView.stop()
         super.onDestroy()
     }

@@ -1,5 +1,8 @@
 package com.wirelessmonitor
 
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Handler
@@ -16,121 +19,338 @@ class VideoReceiver(
     private val surface: Surface,
     private val onVideoSize: (width: Int, height: Int) -> Unit
 ) {
+
     companion object {
-        private const val PORT = 5000
-        private const val PACKET_CONFIG = 0
-        private const val PACKET_FRAME = 1
+        const val PORT = 5000
+
+        private const val PACKET_VIDEO_CONFIG = 0
+        private const val PACKET_VIDEO_FRAME = 1
+        private const val PACKET_AUDIO_CONFIG = 2
+        private const val PACKET_AUDIO_FRAME = 3
+
         private const val MAX_PACKET_SIZE = 8 * 1024 * 1024
     }
 
     private var serverSocket: ServerSocket? = null
     private var socket: Socket? = null
-    private var decoder: MediaCodec? = null
+
+    private var videoDecoder: MediaCodec? = null
+    private var audioDecoder: MediaCodec? = null
+    private var audioTrack: AudioTrack? = null
+
     private val running = AtomicBoolean(false)
+
     private var worker: Thread? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     fun start() {
+
         if (running.get()) return
+
         running.set(true)
-        worker = Thread { runReceiver() }
+
+        worker = Thread {
+            runReceiver()
+        }
+
         worker?.start()
     }
 
     private fun runReceiver() {
+
         try {
+
             serverSocket = ServerSocket(PORT)
+
             socket = serverSocket!!.accept()
+
             socket!!.tcpNoDelay = true
 
-            val input = DataInputStream(BufferedInputStream(socket!!.getInputStream(), 1024 * 1024))
+            val input =
+                DataInputStream(
+                    BufferedInputStream(
+                        socket!!.getInputStream(),
+                        1024 * 1024
+                    )
+                )
 
-            val packetType = input.readInt()
-            if (packetType != PACKET_CONFIG) throw Exception("Expected H.264 configuration")
+            while (running.get()) {
 
-            val videoWidth = input.readInt()
-            val videoHeight = input.readInt()
-            if (videoWidth <= 0 || videoHeight <= 0) throw Exception("Invalid video size")
+                when (val packetType = input.readInt()) {
 
-            val configSize = input.readInt()
-            if (configSize <= 0 || configSize > MAX_PACKET_SIZE) throw Exception("Invalid codec configuration")
+                    PACKET_VIDEO_CONFIG -> handleVideoConfig(input)
+                    PACKET_VIDEO_FRAME -> handleVideoFrame(input)
+                    PACKET_AUDIO_CONFIG -> handleAudioConfig(input)
+                    PACKET_AUDIO_FRAME -> handleAudioFrame(input)
+                    else -> throw Exception("Unknown packet type $packetType")
+                }
+            }
 
-            val config = ByteArray(configSize)
-            input.readFully(config)
-
-            val configBuffer = ByteBuffer.wrap(config)
-            val spsLength = configBuffer.int
-            if (spsLength <= 0 || spsLength > configBuffer.remaining()) throw Exception("Invalid SPS")
-            val sps = ByteArray(spsLength)
-            configBuffer.get(sps)
-
-            val ppsLength = configBuffer.int
-            if (ppsLength <= 0 || ppsLength > configBuffer.remaining()) throw Exception("Invalid PPS")
-            val pps = ByteArray(ppsLength)
-            configBuffer.get(pps)
-
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, videoWidth, videoHeight)
-            format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
-            format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
-
-            mainHandler.post { onVideoSize(videoWidth, videoHeight) }
-
-            decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            decoder!!.configure(format, surface, null, 0)
-            decoder!!.start()
-
-            receiveFrames(input)
         } catch (_: Exception) {
+
+            // Connection ended or receiver stopped.
+
         } finally {
+
             cleanup()
         }
     }
 
-    private fun receiveFrames(input: DataInputStream) {
-        val codec = decoder ?: return
+    private fun handleVideoConfig(input: DataInputStream) {
+
+        val videoWidth = input.readInt()
+        val videoHeight = input.readInt()
+
+        if (videoWidth <= 0 || videoHeight <= 0) {
+            throw Exception("Invalid video size")
+        }
+
+        val configSize = input.readInt()
+
+        if (configSize <= 0 || configSize > MAX_PACKET_SIZE) {
+            throw Exception("Invalid codec configuration")
+        }
+
+        val config = ByteArray(configSize)
+        input.readFully(config)
+
+        val configBuffer = ByteBuffer.wrap(config)
+
+        val spsLength = configBuffer.int
+
+        if (spsLength <= 0 || spsLength > configBuffer.remaining()) {
+            throw Exception("Invalid SPS")
+        }
+
+        val sps = ByteArray(spsLength)
+        configBuffer.get(sps)
+
+        val ppsLength = configBuffer.int
+
+        if (ppsLength <= 0 || ppsLength > configBuffer.remaining()) {
+            throw Exception("Invalid PPS")
+        }
+
+        val pps = ByteArray(ppsLength)
+        configBuffer.get(pps)
+
+        val format =
+            MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC,
+                videoWidth,
+                videoHeight
+            )
+
+        format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
+        format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
+
+        mainHandler.post {
+            onVideoSize(videoWidth, videoHeight)
+        }
+
+        try { videoDecoder?.stop() } catch (_: Exception) {}
+        try { videoDecoder?.release() } catch (_: Exception) {}
+
+        videoDecoder =
+            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+
+        videoDecoder!!.configure(format, surface, null, 0)
+        videoDecoder!!.start()
+    }
+
+    private fun handleVideoFrame(input: DataInputStream) {
+
+        val size = input.readInt()
+        val flags = input.readInt()
+        val presentationTimeUs = input.readLong()
+
+        if (size <= 0 || size > MAX_PACKET_SIZE) {
+            throw Exception("Invalid video frame")
+        }
+
+        val data = ByteArray(size)
+        input.readFully(data)
+
+        val codec = videoDecoder ?: return
+
+        val inputIndex = codec.dequeueInputBuffer(10_000)
+
+        if (inputIndex >= 0) {
+
+            val inputBuffer = codec.getInputBuffer(inputIndex)
+
+            if (inputBuffer != null) {
+                inputBuffer.clear()
+                inputBuffer.put(data)
+                codec.queueInputBuffer(
+                    inputIndex,
+                    0,
+                    data.size,
+                    presentationTimeUs,
+                    flags
+                )
+            }
+        }
+
         val bufferInfo = MediaCodec.BufferInfo()
+        var outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
 
-        while (running.get()) {
-            val packetType = input.readInt()
-            if (packetType != PACKET_FRAME) break
+        while (outputIndex >= 0) {
+            codec.releaseOutputBuffer(outputIndex, true)
+            outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+        }
+    }
 
-            val size = input.readInt()
-            val flags = input.readInt()
-            val presentationTimeUs = input.readLong()
-            if (size <= 0 || size > MAX_PACKET_SIZE) break
+    private fun handleAudioConfig(input: DataInputStream) {
 
-            val data = ByteArray(size)
-            input.readFully(data)
+        val sampleRate = input.readInt()
+        val channelCount = input.readInt()
 
-            val inputIndex = codec.dequeueInputBuffer(10_000)
-            if (inputIndex >= 0) {
-                val inputBuffer = codec.getInputBuffer(inputIndex)
-                if (inputBuffer != null) {
-                    inputBuffer.clear()
-                    inputBuffer.put(data)
-                    codec.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, flags)
-                }
+        val csd0Size = input.readInt()
+
+        if (csd0Size < 0 || csd0Size > MAX_PACKET_SIZE) {
+            throw Exception("Invalid audio configuration")
+        }
+
+        val csd0 = ByteArray(csd0Size)
+        if (csd0Size > 0) input.readFully(csd0)
+
+        val format =
+            MediaFormat.createAudioFormat(
+                MediaFormat.MIMETYPE_AUDIO_AAC,
+                sampleRate,
+                channelCount
+            )
+
+        if (csd0Size > 0) {
+            format.setByteBuffer("csd-0", ByteBuffer.wrap(csd0))
+        }
+
+        try { audioDecoder?.stop() } catch (_: Exception) {}
+        try { audioDecoder?.release() } catch (_: Exception) {}
+
+        audioDecoder =
+            MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+
+        audioDecoder!!.configure(format, null, null, 0)
+        audioDecoder!!.start()
+
+        val channelConfig = if (channelCount >= 2) {
+            AudioFormat.CHANNEL_OUT_STEREO
+        } else {
+            AudioFormat.CHANNEL_OUT_MONO
+        }
+
+        val minBufferSize =
+            AudioTrack.getMinBufferSize(
+                sampleRate,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+
+        try { audioTrack?.stop() } catch (_: Exception) {}
+        try { audioTrack?.release() } catch (_: Exception) {}
+
+        audioTrack =
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelConfig)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBufferSize * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+
+        audioTrack!!.play()
+    }
+
+    private fun handleAudioFrame(input: DataInputStream) {
+
+        val size = input.readInt()
+        val presentationTimeUs = input.readLong()
+
+        if (size <= 0 || size > MAX_PACKET_SIZE) {
+            throw Exception("Invalid audio frame")
+        }
+
+        val data = ByteArray(size)
+        input.readFully(data)
+
+        val codec = audioDecoder ?: return
+
+        val inputIndex = codec.dequeueInputBuffer(10_000)
+
+        if (inputIndex >= 0) {
+
+            val inputBuffer = codec.getInputBuffer(inputIndex)
+
+            if (inputBuffer != null) {
+                inputBuffer.clear()
+                inputBuffer.put(data)
+                codec.queueInputBuffer(
+                    inputIndex,
+                    0,
+                    data.size,
+                    presentationTimeUs,
+                    0
+                )
+            }
+        }
+
+        val bufferInfo = MediaCodec.BufferInfo()
+        var outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+
+        while (outputIndex >= 0) {
+
+            val outputBuffer = codec.getOutputBuffer(outputIndex)
+
+            if (outputBuffer != null && bufferInfo.size > 0) {
+                val pcm = ByteArray(bufferInfo.size)
+                outputBuffer.position(bufferInfo.offset)
+                outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                outputBuffer.get(pcm)
+                audioTrack?.write(pcm, 0, pcm.size)
             }
 
-            var outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-            while (outputIndex >= 0) {
-                codec.releaseOutputBuffer(outputIndex, true)
-                outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-            }
+            codec.releaseOutputBuffer(outputIndex, false)
+            outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
         }
     }
 
     fun stop() {
+
         running.set(false)
+
         cleanup()
     }
 
     private fun cleanup() {
+
         try { socket?.close() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
-        try { decoder?.stop() } catch (_: Exception) {}
-        try { decoder?.release() } catch (_: Exception) {}
-        decoder = null
+
+        try { videoDecoder?.stop() } catch (_: Exception) {}
+        try { videoDecoder?.release() } catch (_: Exception) {}
+
+        try { audioDecoder?.stop() } catch (_: Exception) {}
+        try { audioDecoder?.release() } catch (_: Exception) {}
+
+        try { audioTrack?.stop() } catch (_: Exception) {}
+        try { audioTrack?.release() } catch (_: Exception) {}
+
+        videoDecoder = null
+        audioDecoder = null
+        audioTrack = null
         socket = null
         serverSocket = null
     }
