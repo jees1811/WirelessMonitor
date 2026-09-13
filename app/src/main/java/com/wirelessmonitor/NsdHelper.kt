@@ -14,36 +14,44 @@ object NsdHelper {
     private var registrationListener: NsdManager.RegistrationListener? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
 
+    private fun getNsdManager(context: Context): NsdManager? {
+        return try {
+            context.applicationContext.getSystemService(Context.NSD_SERVICE) as? NsdManager
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun registerService(context: Context, port: Int) {
 
-        val nsdManager =
-            context.applicationContext.getSystemService(Context.NSD_SERVICE) as NsdManager
-
-        val serviceInfo = NsdServiceInfo().apply {
-            serviceName = SERVICE_NAME
-            serviceType = SERVICE_TYPE
-            setPort(port)
-        }
-
-        val listener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(info: NsdServiceInfo) {}
-            override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
-            override fun onServiceUnregistered(info: NsdServiceInfo) {}
-            override fun onUnregistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
-        }
-
-        registrationListener = listener
-
         try {
+
+            val nsdManager = getNsdManager(context) ?: return
+
+            val serviceInfo = NsdServiceInfo().apply {
+                serviceName = SERVICE_NAME
+                serviceType = SERVICE_TYPE
+                setPort(port)
+            }
+
+            val listener = object : NsdManager.RegistrationListener {
+                override fun onServiceRegistered(info: NsdServiceInfo) {}
+                override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
+                override fun onServiceUnregistered(info: NsdServiceInfo) {}
+                override fun onUnregistrationFailed(info: NsdServiceInfo, errorCode: Int) {}
+            }
+
+            registrationListener = listener
+
             nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, listener)
+
         } catch (_: Exception) {
         }
     }
 
     fun unregisterService(context: Context) {
         try {
-            val nsdManager =
-                context.applicationContext.getSystemService(Context.NSD_SERVICE) as NsdManager
+            val nsdManager = getNsdManager(context) ?: return
             registrationListener?.let { nsdManager.unregisterService(it) }
         } catch (_: Exception) {
         }
@@ -56,80 +64,95 @@ object NsdHelper {
         onFailure: () -> Unit
     ) {
 
-        val nsdManager =
-            context.applicationContext.getSystemService(Context.NSD_SERVICE) as NsdManager
+        val nsdManager = getNsdManager(context)
+
+        if (nsdManager == null) {
+            onFailure()
+            return
+        }
 
         var finished = false
 
-        val listener = object : NsdManager.DiscoveryListener {
+        try {
 
-            override fun onDiscoveryStarted(serviceType: String) {}
+            val listener = object : NsdManager.DiscoveryListener {
 
-            override fun onServiceFound(service: NsdServiceInfo) {
+                override fun onDiscoveryStarted(serviceType: String) {}
 
-                if (!service.serviceName.contains(SERVICE_NAME)) return
+                override fun onServiceFound(service: NsdServiceInfo) {
 
-                nsdManager.resolveService(service, object : NsdManager.ResolveListener {
+                    if (!service.serviceName.contains(SERVICE_NAME)) return
 
-                    override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
+                    try {
+
+                        nsdManager.resolveService(service, object : NsdManager.ResolveListener {
+
+                            override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
+                                if (!finished) {
+                                    finished = true
+                                    stopSafely(nsdManager)
+                                    onFailure()
+                                }
+                            }
+
+                            override fun onServiceResolved(info: NsdServiceInfo) {
+                                if (finished) return
+
+                                val host = info.host?.hostAddress
+
+                                if (host == null) {
+                                    finished = true
+                                    stopSafely(nsdManager)
+                                    onFailure()
+                                    return
+                                }
+
+                                finished = true
+                                stopSafely(nsdManager)
+                                onFound(host, info.port)
+                            }
+                        })
+
+                    } catch (_: Exception) {
                         if (!finished) {
                             finished = true
                             stopSafely(nsdManager)
                             onFailure()
                         }
                     }
+                }
 
-                    override fun onServiceResolved(info: NsdServiceInfo) {
-                        if (finished) return
+                override fun onServiceLost(service: NsdServiceInfo) {}
+                override fun onDiscoveryStopped(serviceType: String) {}
 
-                        val host = info.host?.hostAddress
-
-                        if (host == null) {
-                            finished = true
-                            stopSafely(nsdManager)
-                            onFailure()
-                            return
-                        }
-
+                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                    if (!finished) {
                         finished = true
-                        stopSafely(nsdManager)
-                        onFound(host, info.port)
+                        onFailure()
                     }
-                })
+                }
+
+                override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
             }
 
-            override fun onServiceLost(service: NsdServiceInfo) {}
-            override fun onDiscoveryStopped(serviceType: String) {}
+            discoveryListener = listener
 
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+            nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+
+            Handler(Looper.getMainLooper()).postDelayed({
                 if (!finished) {
                     finished = true
+                    stopSafely(nsdManager)
                     onFailure()
                 }
-            }
+            }, 6000)
 
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
-        }
-
-        discoveryListener = listener
-
-        try {
-            nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
         } catch (_: Exception) {
             if (!finished) {
                 finished = true
                 onFailure()
             }
-            return
         }
-
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (!finished) {
-                finished = true
-                stopSafely(nsdManager)
-                onFailure()
-            }
-        }, 6000)
     }
 
     private fun stopSafely(nsdManager: NsdManager) {

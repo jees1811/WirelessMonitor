@@ -12,6 +12,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
@@ -103,7 +104,17 @@ class MainActivity : Activity() {
         root.addView(ipInput)
         root.addView(receiverButton)
 
-        setContentView(root)
+        val scrollView = ScrollView(this)
+
+        scrollView.addView(
+            root,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+
+        setContentView(scrollView)
 
         senderButton.setOnClickListener { startSenderFlow() }
 
