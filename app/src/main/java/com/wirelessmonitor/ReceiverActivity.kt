@@ -20,8 +20,6 @@ class ReceiverActivity : Activity() {
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        hideSystemBars()
-
         videoView = VideoReceiverView(this)
 
         val root = FrameLayout(this)
@@ -36,6 +34,8 @@ class ReceiverActivity : Activity() {
         )
 
         setContentView(root)
+
+        hideSystemBars()
 
         videoView.start()
 
