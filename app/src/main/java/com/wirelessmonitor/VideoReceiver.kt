@@ -17,7 +17,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class VideoReceiver(
     private val surface: Surface,
-    private val onVideoSize: (width: Int, height: Int) -> Unit
+    private val onVideoSize: (width: Int, height: Int) -> Unit,
+    private val onStatus: (String) -> Unit
 ) {
 
     companion object {
@@ -61,11 +62,19 @@ class VideoReceiver(
 
         try {
 
+            mainHandler.post {
+                onStatus("Waiting for the OnePlus 13 to connect...")
+            }
+
             serverSocket = ServerSocket(PORT)
 
             socket = serverSocket!!.accept()
 
             socket!!.tcpNoDelay = true
+
+            mainHandler.post {
+                onStatus("Connected - waiting for video...")
+            }
 
             val input =
                 DataInputStream(
@@ -87,9 +96,13 @@ class VideoReceiver(
                 }
             }
 
-        } catch (_: Exception) {
+        } catch (e: Exception) {
 
-            // Connection ended or receiver stopped.
+            mainHandler.post {
+                onStatus(
+                    "Disconnected: ${e.javaClass.simpleName}: ${e.message ?: "no details"}"
+                )
+            }
 
         } finally {
 
@@ -145,10 +158,6 @@ class VideoReceiver(
         format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
         format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
 
-        mainHandler.post {
-            onVideoSize(videoWidth, videoHeight)
-        }
-
         try { videoDecoder?.stop() } catch (_: Exception) {}
         try { videoDecoder?.release() } catch (_: Exception) {}
 
@@ -157,6 +166,11 @@ class VideoReceiver(
 
         videoDecoder!!.configure(format, surface, null, 0)
         videoDecoder!!.start()
+
+        mainHandler.post {
+            onVideoSize(videoWidth, videoHeight)
+            onStatus("Connected")
+        }
     }
 
     private fun handleVideoFrame(input: DataInputStream) {
