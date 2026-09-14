@@ -11,10 +11,21 @@ class VideoReceiverView(
 ) : TextureView(context),
     TextureView.SurfaceTextureListener {
 
+    enum class FillMode {
+        FIT,
+        FILL
+    }
+
     private var receiver: VideoReceiver? = null
 
     private var videoWidth = 0
     private var videoHeight = 0
+
+    var fillMode: FillMode = FillMode.FIT
+        set(value) {
+            field = value
+            applyTransform()
+        }
 
     var onStatus: ((String) -> Unit)? = null
 
@@ -41,7 +52,7 @@ class VideoReceiverView(
             onVideoSize = { w, h ->
                 videoWidth = w
                 videoHeight = h
-                applyCropFillTransform()
+                applyTransform()
             },
             onStatus = { status ->
                 onStatus?.invoke(status)
@@ -56,7 +67,7 @@ class VideoReceiverView(
         width: Int,
         height: Int
     ) {
-        applyCropFillTransform()
+        applyTransform()
     }
 
     override fun onSurfaceTextureDestroyed(
@@ -71,7 +82,7 @@ class VideoReceiverView(
         surfaceTexture: SurfaceTexture
     ) {}
 
-    private fun applyCropFillTransform() {
+    private fun applyTransform() {
 
         if (videoWidth == 0 || videoHeight == 0) return
 
@@ -86,10 +97,23 @@ class VideoReceiverView(
         var scaleX = 1f
         var scaleY = 1f
 
-        if (videoAspect > viewAspect) {
-            scaleX = videoAspect / viewAspect
-        } else {
-            scaleY = viewAspect / videoAspect
+        when (fillMode) {
+
+            FillMode.FILL -> {
+                if (videoAspect > viewAspect) {
+                    scaleX = videoAspect / viewAspect
+                } else {
+                    scaleY = viewAspect / videoAspect
+                }
+            }
+
+            FillMode.FIT -> {
+                if (videoAspect > viewAspect) {
+                    scaleY = viewAspect / videoAspect
+                } else {
+                    scaleX = videoAspect / viewAspect
+                }
+            }
         }
 
         val matrix = Matrix()

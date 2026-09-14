@@ -9,6 +9,7 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.TextView
 
@@ -16,6 +17,7 @@ class ReceiverActivity : Activity() {
 
     private lateinit var videoView: VideoReceiverView
     private lateinit var statusText: TextView
+    private lateinit var modeButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,6 +33,11 @@ class ReceiverActivity : Activity() {
             textSize = 20f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
+        }
+
+        modeButton = Button(this).apply {
+            text = "Fit"
+            alpha = 0.6f
         }
 
         val root = FrameLayout(this)
@@ -54,6 +61,18 @@ class ReceiverActivity : Activity() {
             }
         )
 
+        root.addView(
+            modeButton,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = 24
+                rightMargin = 24
+            }
+        )
+
         setContentView(root)
 
         hideSystemBars()
@@ -63,6 +82,18 @@ class ReceiverActivity : Activity() {
                 statusText.text = status
                 statusText.visibility =
                     if (status == "Connected") View.GONE else View.VISIBLE
+            }
+        }
+
+        videoView.fillMode = VideoReceiverView.FillMode.FIT
+
+        modeButton.setOnClickListener {
+            videoView.fillMode = if (videoView.fillMode == VideoReceiverView.FillMode.FIT) {
+                modeButton.text = "Fill"
+                VideoReceiverView.FillMode.FILL
+            } else {
+                modeButton.text = "Fit"
+                VideoReceiverView.FillMode.FIT
             }
         }
 
