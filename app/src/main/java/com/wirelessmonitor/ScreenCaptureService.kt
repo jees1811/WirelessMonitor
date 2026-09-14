@@ -21,7 +21,9 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.Surface
@@ -136,8 +138,17 @@ class ScreenCaptureService : Service() {
             val manager =
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-            mediaProjection =
+                        mediaProjection =
                 manager.getMediaProjection(resultCode, projectionData)
+
+            mediaProjection!!.registerCallback(
+                object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        stopStreaming()
+                    }
+                },
+                Handler(Looper.getMainLooper())
+            )
 
             socket = Socket(receiverIp, PORT)
             socket!!.tcpNoDelay = true
