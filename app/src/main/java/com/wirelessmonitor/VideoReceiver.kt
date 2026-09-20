@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Surface
@@ -62,24 +63,58 @@ class VideoReceiver(
 
         try {
 
-            mainHandler.post {
-                onStatus("Waiting for the OnePlus 13 to connect...")
-            }
-
             serverSocket = ServerSocket(PORT)
 
-            socket = serverSocket!!.accept()
+            while (running.get()) {
 
-            socket!!.tcpNoDelay = true
+                mainHandler.post {
+                    onStatus("Waiting for the OnePlus 13 to connect...")
+                }
+
+                val incoming = try {
+                    serverSocket!!.accept()
+                } catch (_: Exception) {
+                    break
+                }
+
+                socket = incoming
+                socket!!.tcpNoDelay = true
+
+                mainHandler.post {
+                    onStatus("Connected - waiting for video...")
+                }
+
+                handleConnection(socket!!)
+
+                if (running.get()) {
+                    mainHandler.post {
+                        onStatus("Disconnected - waiting to reconnect...")
+                    }
+                }
+
+                resetDecoders()
+            }
+
+        } catch (e: Exception) {
 
             mainHandler.post {
-                onStatus("Connected - waiting for video...")
+                onStatus("Error: ${e.javaClass.simpleName}: ${e.message ?: "no details"}")
             }
+
+        } finally {
+
+            cleanup()
+        }
+    }
+
+    private fun handleConnection(activeSocket: Socket) {
+
+        try {
 
             val input =
                 DataInputStream(
                     BufferedInputStream(
-                        socket!!.getInputStream(),
+                        activeSocket.getInputStream(),
                         1024 * 1024
                     )
                 )
@@ -96,18 +131,27 @@ class VideoReceiver(
                 }
             }
 
-        } catch (e: Exception) {
-
-            mainHandler.post {
-                onStatus(
-                    "Disconnected: ${e.javaClass.simpleName}: ${e.message ?: "no details"}"
-                )
-            }
+        } catch (_: Exception) {
 
         } finally {
 
-            cleanup()
+            try { activeSocket.close() } catch (_: Exception) {}
         }
+    }
+
+    private fun resetDecoders() {
+
+        try { videoDecoder?.stop() } catch (_: Exception) {}
+        try { videoDecoder?.release() } catch (_: Exception) {}
+        videoDecoder = null
+
+        try { audioDecoder?.stop() } catch (_: Exception) {}
+        try { audioDecoder?.release() } catch (_: Exception) {}
+        audioDecoder = null
+
+        try { audioTrack?.stop() } catch (_: Exception) {}
+        try { audioTrack?.release() } catch (_: Exception) {}
+        audioTrack = null
     }
 
     private fun handleVideoConfig(input: DataInputStream) {
@@ -157,6 +201,13 @@ class VideoReceiver(
 
         format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
         format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            } catch (_: Exception) {
+            }
+        }
 
         try { videoDecoder?.stop() } catch (_: Exception) {}
         try { videoDecoder?.release() } catch (_: Exception) {}
@@ -353,18 +404,8 @@ class VideoReceiver(
         try { socket?.close() } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {}
 
-        try { videoDecoder?.stop() } catch (_: Exception) {}
-        try { videoDecoder?.release() } catch (_: Exception) {}
+        resetDecoders()
 
-        try { audioDecoder?.stop() } catch (_: Exception) {}
-        try { audioDecoder?.release() } catch (_: Exception) {}
-
-        try { audioTrack?.stop() } catch (_: Exception) {}
-        try { audioTrack?.release() } catch (_: Exception) {}
-
-        videoDecoder = null
-        audioDecoder = null
-        audioTrack = null
         socket = null
         serverSocket = null
     }

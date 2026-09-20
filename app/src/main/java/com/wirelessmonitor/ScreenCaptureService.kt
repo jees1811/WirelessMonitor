@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -24,6 +25,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.view.Display
 import android.view.Surface
@@ -44,6 +46,8 @@ class ScreenCaptureService : Service() {
         const val EXTRA_MAX_DIMENSION = "max_dimension"
         const val EXTRA_VIDEO_BITRATE = "video_bitrate"
 
+        const val ACTION_STOP = "com.wirelessmonitor.STOP"
+
         private const val CHANNEL_ID = "wireless_monitor_capture"
 
         const val PORT = 5000
@@ -60,6 +64,8 @@ class ScreenCaptureService : Service() {
         private const val PACKET_VIDEO_FRAME = 1
         private const val PACKET_AUDIO_CONFIG = 2
         private const val PACKET_AUDIO_FRAME = 3
+
+        private const val RECONNECT_DELAY_MS = 2000L
     }
 
     private var mediaProjection: MediaProjection? = null
@@ -71,8 +77,14 @@ class ScreenCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var audioEncoder: MediaCodec? = null
 
-    private var socket: Socket? = null
-    private var output: DataOutputStream? = null
+    @Volatile private var socket: Socket? = null
+    @Volatile private var output: DataOutputStream? = null
+
+    @Volatile private var reconnecting = false
+    private var receiverIpAddress = ""
+
+    private var cachedSps: ByteArray? = null
+    private var cachedPps: ByteArray? = null
 
     private var captureWidth = 0
     private var captureHeight = 0
@@ -82,12 +94,19 @@ class ScreenCaptureService : Service() {
 
     private val running = AtomicBoolean(false)
 
+    private var wakeLock: PowerManager.WakeLock? = null
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+
+        if (intent?.action == ACTION_STOP) {
+            stopStreaming()
+            return START_NOT_STICKY
+        }
 
         if (intent == null) {
             stopSelf()
@@ -118,13 +137,43 @@ class ScreenCaptureService : Service() {
             return START_NOT_STICKY
         }
 
+        receiverIpAddress = receiverIp
+
         startForeground(1, createNotification())
+
+        acquireWakeLock()
 
         Thread {
             startStreaming(resultCode, projectionData, receiverIp)
         }.start()
 
         return START_NOT_STICKY
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireWakeLock() {
+
+        try {
+
+            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
+                "WirelessMonitor::CastWakeLock"
+            )
+
+            wakeLock?.acquire(12 * 60 * 60 * 1000L)
+
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {
+        }
+        wakeLock = null
     }
 
     private fun startStreaming(
@@ -138,7 +187,7 @@ class ScreenCaptureService : Service() {
             val manager =
                 getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-                        mediaProjection =
+            mediaProjection =
                 manager.getMediaProjection(resultCode, projectionData)
 
             mediaProjection!!.registerCallback(
@@ -239,6 +288,13 @@ class ScreenCaptureService : Service() {
         format.setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
         format.setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                format.setInteger(MediaFormat.KEY_LATENCY, 0)
+            } catch (_: Exception) {
+            }
+        }
 
         videoEncoder =
             MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -476,22 +532,36 @@ class ScreenCaptureService : Service() {
         val pps = ByteArray(ppsBuffer.remaining())
         ppsBuffer.get(pps)
 
-        synchronized(this) {
+        cachedSps = sps
+        cachedPps = pps
 
-            output?.writeInt(PACKET_VIDEO_CONFIG)
-            output?.writeInt(captureWidth)
-            output?.writeInt(captureHeight)
+        writeVideoConfiguration(sps, pps)
+    }
 
-            val totalSize = 4 + sps.size + 4 + pps.size
-            output?.writeInt(totalSize)
+    private fun writeVideoConfiguration(sps: ByteArray, pps: ByteArray) {
 
-            output?.writeInt(sps.size)
-            output?.write(sps)
+        try {
 
-            output?.writeInt(pps.size)
-            output?.write(pps)
+            synchronized(this) {
 
-            output?.flush()
+                output?.writeInt(PACKET_VIDEO_CONFIG)
+                output?.writeInt(captureWidth)
+                output?.writeInt(captureHeight)
+
+                val totalSize = 4 + sps.size + 4 + pps.size
+                output?.writeInt(totalSize)
+
+                output?.writeInt(sps.size)
+                output?.write(sps)
+
+                output?.writeInt(pps.size)
+                output?.write(pps)
+
+                output?.flush()
+            }
+
+        } catch (_: Exception) {
+            attemptReconnect()
         }
     }
 
@@ -501,13 +571,19 @@ class ScreenCaptureService : Service() {
         presentationTimeUs: Long
     ) {
 
-        synchronized(this) {
-            output?.writeInt(PACKET_VIDEO_FRAME)
-            output?.writeInt(data.size)
-            output?.writeInt(flags)
-            output?.writeLong(presentationTimeUs)
-            output?.write(data)
-            output?.flush()
+        try {
+
+            synchronized(this) {
+                output?.writeInt(PACKET_VIDEO_FRAME)
+                output?.writeInt(data.size)
+                output?.writeInt(flags)
+                output?.writeLong(presentationTimeUs)
+                output?.write(data)
+                output?.flush()
+            }
+
+        } catch (_: Exception) {
+            attemptReconnect()
         }
     }
 
@@ -526,13 +602,19 @@ class ScreenCaptureService : Service() {
             ByteArray(0)
         }
 
-        synchronized(this) {
-            output?.writeInt(PACKET_AUDIO_CONFIG)
-            output?.writeInt(sampleRate)
-            output?.writeInt(channelCount)
-            output?.writeInt(csd0.size)
-            output?.write(csd0)
-            output?.flush()
+        try {
+
+            synchronized(this) {
+                output?.writeInt(PACKET_AUDIO_CONFIG)
+                output?.writeInt(sampleRate)
+                output?.writeInt(channelCount)
+                output?.writeInt(csd0.size)
+                output?.write(csd0)
+                output?.flush()
+            }
+
+        } catch (_: Exception) {
+            attemptReconnect()
         }
     }
 
@@ -541,18 +623,69 @@ class ScreenCaptureService : Service() {
         presentationTimeUs: Long
     ) {
 
-        synchronized(this) {
-            output?.writeInt(PACKET_AUDIO_FRAME)
-            output?.writeInt(data.size)
-            output?.writeLong(presentationTimeUs)
-            output?.write(data)
-            output?.flush()
+        try {
+
+            synchronized(this) {
+                output?.writeInt(PACKET_AUDIO_FRAME)
+                output?.writeInt(data.size)
+                output?.writeLong(presentationTimeUs)
+                output?.write(data)
+                output?.flush()
+            }
+
+        } catch (_: Exception) {
+            attemptReconnect()
         }
+    }
+
+    private fun attemptReconnect() {
+
+        synchronized(this) {
+            if (reconnecting) return
+            reconnecting = true
+        }
+
+        Thread {
+
+            while (running.get()) {
+
+                try {
+
+                    val newSocket = Socket(receiverIpAddress, PORT)
+                    newSocket.tcpNoDelay = true
+                    val newOutput = DataOutputStream(newSocket.getOutputStream())
+
+                    synchronized(this) {
+                        try { socket?.close() } catch (_: Exception) {}
+                        socket = newSocket
+                        output = newOutput
+                    }
+
+                    val sps = cachedSps
+                    val pps = cachedPps
+
+                    if (sps != null && pps != null) {
+                        writeVideoConfiguration(sps, pps)
+                    }
+
+                    reconnecting = false
+                    return@Thread
+
+                } catch (_: Exception) {
+                    try { Thread.sleep(RECONNECT_DELAY_MS) } catch (_: Exception) {}
+                }
+            }
+
+            reconnecting = false
+
+        }.start()
     }
 
     private fun stopStreaming() {
 
         running.set(false)
+
+        releaseWakeLock()
 
         try { virtualDisplay?.release() } catch (_: Exception) {}
         try { mediaProjection?.stop() } catch (_: Exception) {}
@@ -600,10 +733,29 @@ class ScreenCaptureService : Service() {
     }
 
     private fun createNotification(): Notification {
+
+        val stopIntent =
+            Intent(this, ScreenCaptureService::class.java).apply {
+                action = ACTION_STOP
+            }
+
+        val stopPendingIntent =
+            PendingIntent.getService(
+                this,
+                0,
+                stopIntent,
+                PendingIntent.FLAG_IMMUTABLE
+            )
+
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Wireless Monitor")
             .setContentText("Screen streaming is active")
             .setSmallIcon(android.R.drawable.ic_menu_view)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Stop Casting",
+                stopPendingIntent
+            )
             .build()
     }
 }
