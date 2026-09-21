@@ -99,7 +99,7 @@ class ReceiverActivity : Activity() {
 
         videoView.start()
 
-        NsdHelper.registerService(this, VideoReceiver.PORT)
+        NsdHelper.registerService(this, VideoReceiver.VIDEO_PORT)
     }
 
     private fun hideSystemBars() {
