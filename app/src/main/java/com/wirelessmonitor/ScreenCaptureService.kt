@@ -50,7 +50,8 @@ class ScreenCaptureService : Service() {
 
         private const val CHANNEL_ID = "wireless_monitor_capture"
 
-        const val PORT = 5000
+        const val VIDEO_PORT = 5000
+        const val AUDIO_PORT = 5001
 
         private const val DEFAULT_MAX_DIMENSION = 1920
         private const val DEFAULT_VIDEO_BITRATE = 16_000_000
@@ -77,14 +78,22 @@ class ScreenCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var audioEncoder: MediaCodec? = null
 
-    @Volatile private var socket: Socket? = null
-    @Volatile private var output: DataOutputStream? = null
-
-    @Volatile private var reconnecting = false
-    private var receiverIpAddress = ""
-
+    private val videoLock = Any()
+    @Volatile private var videoSocket: Socket? = null
+    @Volatile private var videoOutput: DataOutputStream? = null
+    @Volatile private var videoReconnecting = false
     private var cachedSps: ByteArray? = null
     private var cachedPps: ByteArray? = null
+
+    private val audioLock = Any()
+    @Volatile private var audioSocket: Socket? = null
+    @Volatile private var audioOutput: DataOutputStream? = null
+    @Volatile private var audioReconnecting = false
+    private var cachedAudioSampleRate = 0
+    private var cachedAudioChannelCount = 0
+    private var cachedAudioCsd0: ByteArray? = null
+
+    private var receiverIpAddress = ""
 
     private var captureWidth = 0
     private var captureHeight = 0
@@ -199,9 +208,9 @@ class ScreenCaptureService : Service() {
                 Handler(Looper.getMainLooper())
             )
 
-            socket = Socket(receiverIp, PORT)
-            socket!!.tcpNoDelay = true
-            output = DataOutputStream(socket!!.getOutputStream())
+            videoSocket = Socket(receiverIp, VIDEO_PORT)
+            videoSocket!!.tcpNoDelay = true
+            videoOutput = DataOutputStream(videoSocket!!.getOutputStream())
 
             running.set(true)
 
@@ -209,10 +218,19 @@ class ScreenCaptureService : Service() {
 
             val audioReady = setupAudioCaptureIfPermitted()
 
+            if (audioReady) {
+                try {
+                    audioSocket = Socket(receiverIp, AUDIO_PORT)
+                    audioSocket!!.tcpNoDelay = true
+                    audioOutput = DataOutputStream(audioSocket!!.getOutputStream())
+                } catch (_: Exception) {
+                }
+            }
+
             val videoThread = Thread { videoEncodeLoop() }
             videoThread.start()
 
-            if (audioReady) {
+            if (audioReady && audioOutput != null) {
                 Thread { audioEncodeLoop() }.start()
             }
 
@@ -542,26 +560,26 @@ class ScreenCaptureService : Service() {
 
         try {
 
-            synchronized(this) {
+            synchronized(videoLock) {
 
-                output?.writeInt(PACKET_VIDEO_CONFIG)
-                output?.writeInt(captureWidth)
-                output?.writeInt(captureHeight)
+                videoOutput?.writeInt(PACKET_VIDEO_CONFIG)
+                videoOutput?.writeInt(captureWidth)
+                videoOutput?.writeInt(captureHeight)
 
                 val totalSize = 4 + sps.size + 4 + pps.size
-                output?.writeInt(totalSize)
+                videoOutput?.writeInt(totalSize)
 
-                output?.writeInt(sps.size)
-                output?.write(sps)
+                videoOutput?.writeInt(sps.size)
+                videoOutput?.write(sps)
 
-                output?.writeInt(pps.size)
-                output?.write(pps)
+                videoOutput?.writeInt(pps.size)
+                videoOutput?.write(pps)
 
-                output?.flush()
+                videoOutput?.flush()
             }
 
         } catch (_: Exception) {
-            attemptReconnect()
+            attemptVideoReconnect()
         }
     }
 
@@ -573,17 +591,17 @@ class ScreenCaptureService : Service() {
 
         try {
 
-            synchronized(this) {
-                output?.writeInt(PACKET_VIDEO_FRAME)
-                output?.writeInt(data.size)
-                output?.writeInt(flags)
-                output?.writeLong(presentationTimeUs)
-                output?.write(data)
-                output?.flush()
+            synchronized(videoLock) {
+                videoOutput?.writeInt(PACKET_VIDEO_FRAME)
+                videoOutput?.writeInt(data.size)
+                videoOutput?.writeInt(flags)
+                videoOutput?.writeLong(presentationTimeUs)
+                videoOutput?.write(data)
+                videoOutput?.flush()
             }
 
         } catch (_: Exception) {
-            attemptReconnect()
+            attemptVideoReconnect()
         }
     }
 
@@ -602,19 +620,32 @@ class ScreenCaptureService : Service() {
             ByteArray(0)
         }
 
+        cachedAudioSampleRate = sampleRate
+        cachedAudioChannelCount = channelCount
+        cachedAudioCsd0 = csd0
+
+        writeAudioConfiguration(sampleRate, channelCount, csd0)
+    }
+
+    private fun writeAudioConfiguration(
+        sampleRate: Int,
+        channelCount: Int,
+        csd0: ByteArray
+    ) {
+
         try {
 
-            synchronized(this) {
-                output?.writeInt(PACKET_AUDIO_CONFIG)
-                output?.writeInt(sampleRate)
-                output?.writeInt(channelCount)
-                output?.writeInt(csd0.size)
-                output?.write(csd0)
-                output?.flush()
+            synchronized(audioLock) {
+                audioOutput?.writeInt(PACKET_AUDIO_CONFIG)
+                audioOutput?.writeInt(sampleRate)
+                audioOutput?.writeInt(channelCount)
+                audioOutput?.writeInt(csd0.size)
+                audioOutput?.write(csd0)
+                audioOutput?.flush()
             }
 
         } catch (_: Exception) {
-            attemptReconnect()
+            attemptAudioReconnect()
         }
     }
 
@@ -625,24 +656,24 @@ class ScreenCaptureService : Service() {
 
         try {
 
-            synchronized(this) {
-                output?.writeInt(PACKET_AUDIO_FRAME)
-                output?.writeInt(data.size)
-                output?.writeLong(presentationTimeUs)
-                output?.write(data)
-                output?.flush()
+            synchronized(audioLock) {
+                audioOutput?.writeInt(PACKET_AUDIO_FRAME)
+                audioOutput?.writeInt(data.size)
+                audioOutput?.writeLong(presentationTimeUs)
+                audioOutput?.write(data)
+                audioOutput?.flush()
             }
 
         } catch (_: Exception) {
-            attemptReconnect()
+            attemptAudioReconnect()
         }
     }
 
-    private fun attemptReconnect() {
+    private fun attemptVideoReconnect() {
 
-        synchronized(this) {
-            if (reconnecting) return
-            reconnecting = true
+        synchronized(videoLock) {
+            if (videoReconnecting) return
+            videoReconnecting = true
         }
 
         Thread {
@@ -651,14 +682,14 @@ class ScreenCaptureService : Service() {
 
                 try {
 
-                    val newSocket = Socket(receiverIpAddress, PORT)
+                    val newSocket = Socket(receiverIpAddress, VIDEO_PORT)
                     newSocket.tcpNoDelay = true
                     val newOutput = DataOutputStream(newSocket.getOutputStream())
 
-                    synchronized(this) {
-                        try { socket?.close() } catch (_: Exception) {}
-                        socket = newSocket
-                        output = newOutput
+                    synchronized(videoLock) {
+                        try { videoSocket?.close() } catch (_: Exception) {}
+                        videoSocket = newSocket
+                        videoOutput = newOutput
                     }
 
                     val sps = cachedSps
@@ -668,7 +699,7 @@ class ScreenCaptureService : Service() {
                         writeVideoConfiguration(sps, pps)
                     }
 
-                    reconnecting = false
+                    videoReconnecting = false
                     return@Thread
 
                 } catch (_: Exception) {
@@ -676,7 +707,53 @@ class ScreenCaptureService : Service() {
                 }
             }
 
-            reconnecting = false
+            videoReconnecting = false
+
+        }.start()
+    }
+
+    private fun attemptAudioReconnect() {
+
+        synchronized(audioLock) {
+            if (audioReconnecting) return
+            audioReconnecting = true
+        }
+
+        Thread {
+
+            while (running.get()) {
+
+                try {
+
+                    val newSocket = Socket(receiverIpAddress, AUDIO_PORT)
+                    newSocket.tcpNoDelay = true
+                    val newOutput = DataOutputStream(newSocket.getOutputStream())
+
+                    synchronized(audioLock) {
+                        try { audioSocket?.close() } catch (_: Exception) {}
+                        audioSocket = newSocket
+                        audioOutput = newOutput
+                    }
+
+                    val csd0 = cachedAudioCsd0
+
+                    if (csd0 != null && cachedAudioSampleRate > 0) {
+                        writeAudioConfiguration(
+                            cachedAudioSampleRate,
+                            cachedAudioChannelCount,
+                            csd0
+                        )
+                    }
+
+                    audioReconnecting = false
+                    return@Thread
+
+                } catch (_: Exception) {
+                    try { Thread.sleep(RECONNECT_DELAY_MS) } catch (_: Exception) {}
+                }
+            }
+
+            audioReconnecting = false
 
         }.start()
     }
@@ -700,8 +777,11 @@ class ScreenCaptureService : Service() {
         try { audioEncoder?.stop() } catch (_: Exception) {}
         try { audioEncoder?.release() } catch (_: Exception) {}
 
-        try { output?.close() } catch (_: Exception) {}
-        try { socket?.close() } catch (_: Exception) {}
+        try { videoOutput?.close() } catch (_: Exception) {}
+        try { videoSocket?.close() } catch (_: Exception) {}
+
+        try { audioOutput?.close() } catch (_: Exception) {}
+        try { audioSocket?.close() } catch (_: Exception) {}
 
         virtualDisplay = null
         mediaProjection = null
@@ -709,8 +789,10 @@ class ScreenCaptureService : Service() {
         inputSurface = null
         audioRecord = null
         audioEncoder = null
-        output = null
-        socket = null
+        videoOutput = null
+        videoSocket = null
+        audioOutput = null
+        audioSocket = null
 
         stopSelf()
     }
@@ -749,8 +831,9 @@ class ScreenCaptureService : Service() {
 
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Wireless Monitor")
-            .setContentText("Screen streaming is active")
+            .setContentText("Screen streaming is active - tap Stop Casting to end")
             .setSmallIcon(android.R.drawable.ic_menu_view)
+            .setOngoing(true)
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
                 "Stop Casting",
