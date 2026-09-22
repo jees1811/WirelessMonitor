@@ -23,7 +23,8 @@ class VideoReceiver(
 ) {
 
     companion object {
-        const val PORT = 5000
+        const val VIDEO_PORT = 5000
+        const val AUDIO_PORT = 5001
 
         private const val PACKET_VIDEO_CONFIG = 0
         private const val PACKET_VIDEO_FRAME = 1
@@ -33,8 +34,8 @@ class VideoReceiver(
         private const val MAX_PACKET_SIZE = 8 * 1024 * 1024
     }
 
-    private var serverSocket: ServerSocket? = null
-    private var socket: Socket? = null
+    private var videoServerSocket: ServerSocket? = null
+    private var audioServerSocket: ServerSocket? = null
 
     private var videoDecoder: MediaCodec? = null
     private var audioDecoder: MediaCodec? = null
@@ -42,7 +43,8 @@ class VideoReceiver(
 
     private val running = AtomicBoolean(false)
 
-    private var worker: Thread? = null
+    private var videoWorker: Thread? = null
+    private var audioWorker: Thread? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -52,18 +54,18 @@ class VideoReceiver(
 
         running.set(true)
 
-        worker = Thread {
-            runReceiver()
-        }
+        videoWorker = Thread { runVideoReceiver() }
+        videoWorker?.start()
 
-        worker?.start()
+        audioWorker = Thread { runAudioReceiver() }
+        audioWorker?.start()
     }
 
-    private fun runReceiver() {
+    private fun runVideoReceiver() {
 
         try {
 
-            serverSocket = ServerSocket(PORT)
+            videoServerSocket = ServerSocket(VIDEO_PORT)
 
             while (running.get()) {
 
@@ -72,19 +74,18 @@ class VideoReceiver(
                 }
 
                 val incoming = try {
-                    serverSocket!!.accept()
+                    videoServerSocket!!.accept()
                 } catch (_: Exception) {
                     break
                 }
 
-                socket = incoming
-                socket!!.tcpNoDelay = true
+                incoming.tcpNoDelay = true
 
                 mainHandler.post {
                     onStatus("Connected - waiting for video...")
                 }
 
-                handleConnection(socket!!)
+                handleVideoConnection(incoming)
 
                 if (running.get()) {
                     mainHandler.post {
@@ -92,7 +93,9 @@ class VideoReceiver(
                     }
                 }
 
-                resetDecoders()
+                try { videoDecoder?.stop() } catch (_: Exception) {}
+                try { videoDecoder?.release() } catch (_: Exception) {}
+                videoDecoder = null
             }
 
         } catch (e: Exception) {
@@ -103,31 +106,25 @@ class VideoReceiver(
 
         } finally {
 
-            cleanup()
+            try { videoServerSocket?.close() } catch (_: Exception) {}
         }
     }
 
-    private fun handleConnection(activeSocket: Socket) {
+    private fun handleVideoConnection(socket: Socket) {
 
         try {
 
             val input =
                 DataInputStream(
-                    BufferedInputStream(
-                        activeSocket.getInputStream(),
-                        1024 * 1024
-                    )
+                    BufferedInputStream(socket.getInputStream(), 1024 * 1024)
                 )
 
             while (running.get()) {
 
                 when (val packetType = input.readInt()) {
-
                     PACKET_VIDEO_CONFIG -> handleVideoConfig(input)
                     PACKET_VIDEO_FRAME -> handleVideoFrame(input)
-                    PACKET_AUDIO_CONFIG -> handleAudioConfig(input)
-                    PACKET_AUDIO_FRAME -> handleAudioFrame(input)
-                    else -> throw Exception("Unknown packet type $packetType")
+                    else -> throw Exception("Unexpected packet type $packetType on video connection")
                 }
             }
 
@@ -135,23 +132,8 @@ class VideoReceiver(
 
         } finally {
 
-            try { activeSocket.close() } catch (_: Exception) {}
+            try { socket.close() } catch (_: Exception) {}
         }
-    }
-
-    private fun resetDecoders() {
-
-        try { videoDecoder?.stop() } catch (_: Exception) {}
-        try { videoDecoder?.release() } catch (_: Exception) {}
-        videoDecoder = null
-
-        try { audioDecoder?.stop() } catch (_: Exception) {}
-        try { audioDecoder?.release() } catch (_: Exception) {}
-        audioDecoder = null
-
-        try { audioTrack?.stop() } catch (_: Exception) {}
-        try { audioTrack?.release() } catch (_: Exception) {}
-        audioTrack = null
     }
 
     private fun handleVideoConfig(input: DataInputStream) {
@@ -248,13 +230,7 @@ class VideoReceiver(
             if (inputBuffer != null) {
                 inputBuffer.clear()
                 inputBuffer.put(data)
-                codec.queueInputBuffer(
-                    inputIndex,
-                    0,
-                    data.size,
-                    presentationTimeUs,
-                    flags
-                )
+                codec.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, flags)
             }
         }
 
@@ -264,6 +240,67 @@ class VideoReceiver(
         while (outputIndex >= 0) {
             codec.releaseOutputBuffer(outputIndex, true)
             outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+        }
+    }
+
+    private fun runAudioReceiver() {
+
+        try {
+
+            audioServerSocket = ServerSocket(AUDIO_PORT)
+
+            while (running.get()) {
+
+                val incoming = try {
+                    audioServerSocket!!.accept()
+                } catch (_: Exception) {
+                    break
+                }
+
+                incoming.tcpNoDelay = true
+
+                handleAudioConnection(incoming)
+
+                try { audioDecoder?.stop() } catch (_: Exception) {}
+                try { audioDecoder?.release() } catch (_: Exception) {}
+                audioDecoder = null
+
+                try { audioTrack?.stop() } catch (_: Exception) {}
+                try { audioTrack?.release() } catch (_: Exception) {}
+                audioTrack = null
+            }
+
+        } catch (_: Exception) {
+
+        } finally {
+
+            try { audioServerSocket?.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun handleAudioConnection(socket: Socket) {
+
+        try {
+
+            val input =
+                DataInputStream(
+                    BufferedInputStream(socket.getInputStream(), 128 * 1024)
+                )
+
+            while (running.get()) {
+
+                when (val packetType = input.readInt()) {
+                    PACKET_AUDIO_CONFIG -> handleAudioConfig(input)
+                    PACKET_AUDIO_FRAME -> handleAudioFrame(input)
+                    else -> throw Exception("Unexpected packet type $packetType on audio connection")
+                }
+            }
+
+        } catch (_: Exception) {
+
+        } finally {
+
+            try { socket.close() } catch (_: Exception) {}
         }
     }
 
@@ -332,7 +369,7 @@ class VideoReceiver(
                         .setChannelMask(channelConfig)
                         .build()
                 )
-                .setBufferSizeInBytes(minBufferSize * 2)
+                .setBufferSizeInBytes(minBufferSize)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
@@ -362,13 +399,7 @@ class VideoReceiver(
             if (inputBuffer != null) {
                 inputBuffer.clear()
                 inputBuffer.put(data)
-                codec.queueInputBuffer(
-                    inputIndex,
-                    0,
-                    data.size,
-                    presentationTimeUs,
-                    0
-                )
+                codec.queueInputBuffer(inputIndex, 0, data.size, presentationTimeUs, 0)
             }
         }
 
@@ -384,7 +415,7 @@ class VideoReceiver(
                 outputBuffer.position(bufferInfo.offset)
                 outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
                 outputBuffer.get(pcm)
-                audioTrack?.write(pcm, 0, pcm.size)
+                audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
             }
 
             codec.releaseOutputBuffer(outputIndex, false)
@@ -396,17 +427,19 @@ class VideoReceiver(
 
         running.set(false)
 
-        cleanup()
-    }
+        try { videoServerSocket?.close() } catch (_: Exception) {}
+        try { audioServerSocket?.close() } catch (_: Exception) {}
 
-    private fun cleanup() {
+        try { videoDecoder?.stop() } catch (_: Exception) {}
+        try { videoDecoder?.release() } catch (_: Exception) {}
+        videoDecoder = null
 
-        try { socket?.close() } catch (_: Exception) {}
-        try { serverSocket?.close() } catch (_: Exception) {}
+        try { audioDecoder?.stop() } catch (_: Exception) {}
+        try { audioDecoder?.release() } catch (_: Exception) {}
+        audioDecoder = null
 
-        resetDecoders()
-
-        socket = null
-        serverSocket = null
+        try { audioTrack?.stop() } catch (_: Exception) {}
+        try { audioTrack?.release() } catch (_: Exception) {}
+        audioTrack = null
     }
 }
