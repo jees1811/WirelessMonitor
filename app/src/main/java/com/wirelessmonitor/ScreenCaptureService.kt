@@ -31,8 +31,9 @@ import android.view.Display
 import android.view.Surface
 import android.view.WindowManager
 import androidx.core.content.ContextCompat
-import java.io.DataOutputStream
-import java.net.Socket
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -61,12 +62,14 @@ class ScreenCaptureService : Service() {
         private const val AUDIO_SAMPLE_RATE = 48000
         private const val AUDIO_BITRATE = 128_000
 
-        private const val PACKET_VIDEO_CONFIG = 0
-        private const val PACKET_VIDEO_FRAME = 1
-        private const val PACKET_AUDIO_CONFIG = 2
-        private const val PACKET_AUDIO_FRAME = 3
+        private const val TYPE_VIDEO_CONFIG = 10
+        private const val TYPE_VIDEO_FRAME = 11
+        private const val TYPE_AUDIO_CONFIG = 20
+        private const val TYPE_AUDIO_FRAME = 21
 
-        private const val RECONNECT_DELAY_MS = 2000L
+        private const val HEADER_SIZE = 32
+        private const val FRAGMENT_PAYLOAD_SIZE = 1400
+        private const val AUDIO_CONFIG_RESEND_INTERVAL_MS = 1000L
     }
 
     private var mediaProjection: MediaProjection? = null
@@ -78,22 +81,20 @@ class ScreenCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var audioEncoder: MediaCodec? = null
 
-    private val videoLock = Any()
-    @Volatile private var videoSocket: Socket? = null
-    @Volatile private var videoOutput: DataOutputStream? = null
-    @Volatile private var videoReconnecting = false
+    private var videoSocket: DatagramSocket? = null
+    private var audioSocket: DatagramSocket? = null
+    private var receiverAddress: InetAddress? = null
+
+    private var videoFrameCounter = 0
+    private var audioFrameCounter = 0
+
     private var cachedSps: ByteArray? = null
     private var cachedPps: ByteArray? = null
 
-    private val audioLock = Any()
-    @Volatile private var audioSocket: Socket? = null
-    @Volatile private var audioOutput: DataOutputStream? = null
-    @Volatile private var audioReconnecting = false
     private var cachedAudioSampleRate = 0
     private var cachedAudioChannelCount = 0
     private var cachedAudioCsd0: ByteArray? = null
-
-    private var receiverIpAddress = ""
+    private var lastAudioConfigResendTime = 0L
 
     private var captureWidth = 0
     private var captureHeight = 0
@@ -145,8 +146,6 @@ class ScreenCaptureService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-
-        receiverIpAddress = receiverIp
 
         startForeground(1, createNotification())
 
@@ -208,9 +207,10 @@ class ScreenCaptureService : Service() {
                 Handler(Looper.getMainLooper())
             )
 
-            videoSocket = Socket(receiverIp, VIDEO_PORT)
-            videoSocket!!.tcpNoDelay = true
-            videoOutput = DataOutputStream(videoSocket!!.getOutputStream())
+            receiverAddress = InetAddress.getByName(receiverIp)
+
+            videoSocket = DatagramSocket()
+            audioSocket = DatagramSocket()
 
             running.set(true)
 
@@ -218,19 +218,10 @@ class ScreenCaptureService : Service() {
 
             val audioReady = setupAudioCaptureIfPermitted()
 
-            if (audioReady) {
-                try {
-                    audioSocket = Socket(receiverIp, AUDIO_PORT)
-                    audioSocket!!.tcpNoDelay = true
-                    audioOutput = DataOutputStream(audioSocket!!.getOutputStream())
-                } catch (_: Exception) {
-                }
-            }
-
             val videoThread = Thread { videoEncodeLoop() }
             videoThread.start()
 
-            if (audioReady && audioOutput != null) {
+            if (audioReady) {
                 Thread { audioEncodeLoop() }.start()
             }
 
@@ -306,13 +297,6 @@ class ScreenCaptureService : Service() {
         format.setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
         format.setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                format.setInteger(MediaFormat.KEY_LATENCY, 0)
-            } catch (_: Exception) {
-            }
-        }
 
         videoEncoder =
             MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -425,9 +409,55 @@ class ScreenCaptureService : Service() {
         }
     }
 
+    private fun sendFragmented(
+        socket: DatagramSocket,
+        port: Int,
+        type: Int,
+        frameId: Int,
+        flags: Int,
+        presentationTimeUs: Long,
+        data: ByteArray
+    ) {
+
+        val address = receiverAddress ?: return
+
+        val fragmentCount =
+            ((data.size + FRAGMENT_PAYLOAD_SIZE - 1) / FRAGMENT_PAYLOAD_SIZE)
+                .coerceAtLeast(1)
+
+        for (fragmentIndex in 0 until fragmentCount) {
+
+            val start = fragmentIndex * FRAGMENT_PAYLOAD_SIZE
+            val end = minOf(start + FRAGMENT_PAYLOAD_SIZE, data.size)
+            val chunkSize = end - start
+
+            val buffer = ByteBuffer.allocate(HEADER_SIZE + chunkSize)
+            buffer.putInt(type)
+            buffer.putInt(frameId)
+            buffer.putInt(fragmentIndex)
+            buffer.putInt(fragmentCount)
+            buffer.putInt(flags)
+            buffer.putLong(presentationTimeUs)
+            buffer.putInt(data.size)
+            buffer.put(data, start, chunkSize)
+
+            try {
+                val packet = DatagramPacket(
+                    buffer.array(),
+                    buffer.array().size,
+                    address,
+                    port
+                )
+                socket.send(packet)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     private fun videoEncodeLoop() {
 
         val codec = videoEncoder ?: return
+        val socket = videoSocket ?: return
         val info = MediaCodec.BufferInfo()
         var configurationSent = false
 
@@ -441,8 +471,8 @@ class ScreenCaptureService : Service() {
                 val sps = format.getByteBuffer("csd-0")
                 val pps = format.getByteBuffer("csd-1")
 
-                if (sps != null && pps != null && !configurationSent) {
-                    sendVideoConfiguration(sps, pps)
+                if (sps != null && pps != null) {
+                    cacheAndSendVideoConfig(socket, sps, pps)
                     configurationSent = true
                 }
 
@@ -454,11 +484,33 @@ class ScreenCaptureService : Service() {
             val buffer = codec.getOutputBuffer(index)
 
             if (buffer != null && info.size > 0 && configurationSent) {
+
                 buffer.position(info.offset)
                 buffer.limit(info.offset + info.size)
                 val data = ByteArray(info.size)
                 buffer.get(data)
-                sendVideoFrame(data, info.flags, info.presentationTimeUs)
+
+                val isKeyFrame =
+                    (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+                if (isKeyFrame) {
+                    val sps = cachedSps
+                    val pps = cachedPps
+                    if (sps != null && pps != null) {
+                        sendVideoConfigPacket(socket, sps, pps)
+                    }
+                }
+
+                videoFrameCounter++
+                sendFragmented(
+                    socket,
+                    VIDEO_PORT,
+                    TYPE_VIDEO_FRAME,
+                    videoFrameCounter,
+                    info.flags,
+                    info.presentationTimeUs,
+                    data
+                )
             }
 
             codec.releaseOutputBuffer(index, false)
@@ -469,6 +521,7 @@ class ScreenCaptureService : Service() {
 
         val codec = audioEncoder ?: return
         val record = audioRecord ?: return
+        val socket = audioSocket ?: return
 
         val info = MediaCodec.BufferInfo()
         val pcmBuffer = ByteArray(4096)
@@ -518,7 +571,7 @@ class ScreenCaptureService : Service() {
             if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
 
                 if (!configurationSent) {
-                    sendAudioConfiguration(codec.outputFormat)
+                    cacheAndSendAudioConfig(socket, codec.outputFormat)
                     configurationSent = true
                 }
 
@@ -527,11 +580,36 @@ class ScreenCaptureService : Service() {
                 val buffer = codec.getOutputBuffer(outputIndex)
 
                 if (buffer != null && info.size > 0 && configurationSent) {
+
                     buffer.position(info.offset)
                     buffer.limit(info.offset + info.size)
                     val data = ByteArray(info.size)
                     buffer.get(data)
-                    sendAudioFrame(data, info.presentationTimeUs)
+
+                    val now = System.currentTimeMillis()
+                    if (now - lastAudioConfigResendTime > AUDIO_CONFIG_RESEND_INTERVAL_MS) {
+                        val csd0 = cachedAudioCsd0
+                        if (csd0 != null) {
+                            sendAudioConfigPacket(
+                                socket,
+                                cachedAudioSampleRate,
+                                cachedAudioChannelCount,
+                                csd0
+                            )
+                        }
+                        lastAudioConfigResendTime = now
+                    }
+
+                    audioFrameCounter++
+                    sendFragmented(
+                        socket,
+                        AUDIO_PORT,
+                        TYPE_AUDIO_FRAME,
+                        audioFrameCounter,
+                        0,
+                        info.presentationTimeUs,
+                        data
+                    )
                 }
 
                 codec.releaseOutputBuffer(outputIndex, false)
@@ -539,7 +617,8 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    private fun sendVideoConfiguration(
+    private fun cacheAndSendVideoConfig(
+        socket: DatagramSocket,
         spsBuffer: ByteBuffer,
         ppsBuffer: ByteBuffer
     ) {
@@ -553,59 +632,39 @@ class ScreenCaptureService : Service() {
         cachedSps = sps
         cachedPps = pps
 
-        writeVideoConfiguration(sps, pps)
+        sendVideoConfigPacket(socket, sps, pps)
     }
 
-    private fun writeVideoConfiguration(sps: ByteArray, pps: ByteArray) {
-
-        try {
-
-            synchronized(videoLock) {
-
-                videoOutput?.writeInt(PACKET_VIDEO_CONFIG)
-                videoOutput?.writeInt(captureWidth)
-                videoOutput?.writeInt(captureHeight)
-
-                val totalSize = 4 + sps.size + 4 + pps.size
-                videoOutput?.writeInt(totalSize)
-
-                videoOutput?.writeInt(sps.size)
-                videoOutput?.write(sps)
-
-                videoOutput?.writeInt(pps.size)
-                videoOutput?.write(pps)
-
-                videoOutput?.flush()
-            }
-
-        } catch (_: Exception) {
-            attemptVideoReconnect()
-        }
-    }
-
-    private fun sendVideoFrame(
-        data: ByteArray,
-        flags: Int,
-        presentationTimeUs: Long
+    private fun sendVideoConfigPacket(
+        socket: DatagramSocket,
+        sps: ByteArray,
+        pps: ByteArray
     ) {
 
-        try {
+        val payload = ByteBuffer.allocate(16 + sps.size + pps.size)
+        payload.putInt(captureWidth)
+        payload.putInt(captureHeight)
+        payload.putInt(sps.size)
+        payload.put(sps)
+        payload.putInt(pps.size)
+        payload.put(pps)
 
-            synchronized(videoLock) {
-                videoOutput?.writeInt(PACKET_VIDEO_FRAME)
-                videoOutput?.writeInt(data.size)
-                videoOutput?.writeInt(flags)
-                videoOutput?.writeLong(presentationTimeUs)
-                videoOutput?.write(data)
-                videoOutput?.flush()
-            }
-
-        } catch (_: Exception) {
-            attemptVideoReconnect()
-        }
+        videoFrameCounter++
+        sendFragmented(
+            socket,
+            VIDEO_PORT,
+            TYPE_VIDEO_CONFIG,
+            videoFrameCounter,
+            0,
+            0L,
+            payload.array()
+        )
     }
 
-    private fun sendAudioConfiguration(format: MediaFormat) {
+    private fun cacheAndSendAudioConfig(
+        socket: DatagramSocket,
+        format: MediaFormat
+    ) {
 
         val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
         val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -624,138 +683,33 @@ class ScreenCaptureService : Service() {
         cachedAudioChannelCount = channelCount
         cachedAudioCsd0 = csd0
 
-        writeAudioConfiguration(sampleRate, channelCount, csd0)
+        sendAudioConfigPacket(socket, sampleRate, channelCount, csd0)
+        lastAudioConfigResendTime = System.currentTimeMillis()
     }
 
-    private fun writeAudioConfiguration(
+    private fun sendAudioConfigPacket(
+        socket: DatagramSocket,
         sampleRate: Int,
         channelCount: Int,
         csd0: ByteArray
     ) {
 
-        try {
+        val payload = ByteBuffer.allocate(12 + csd0.size)
+        payload.putInt(sampleRate)
+        payload.putInt(channelCount)
+        payload.putInt(csd0.size)
+        payload.put(csd0)
 
-            synchronized(audioLock) {
-                audioOutput?.writeInt(PACKET_AUDIO_CONFIG)
-                audioOutput?.writeInt(sampleRate)
-                audioOutput?.writeInt(channelCount)
-                audioOutput?.writeInt(csd0.size)
-                audioOutput?.write(csd0)
-                audioOutput?.flush()
-            }
-
-        } catch (_: Exception) {
-            attemptAudioReconnect()
-        }
-    }
-
-    private fun sendAudioFrame(
-        data: ByteArray,
-        presentationTimeUs: Long
-    ) {
-
-        try {
-
-            synchronized(audioLock) {
-                audioOutput?.writeInt(PACKET_AUDIO_FRAME)
-                audioOutput?.writeInt(data.size)
-                audioOutput?.writeLong(presentationTimeUs)
-                audioOutput?.write(data)
-                audioOutput?.flush()
-            }
-
-        } catch (_: Exception) {
-            attemptAudioReconnect()
-        }
-    }
-
-    private fun attemptVideoReconnect() {
-
-        synchronized(videoLock) {
-            if (videoReconnecting) return
-            videoReconnecting = true
-        }
-
-        Thread {
-
-            while (running.get()) {
-
-                try {
-
-                    val newSocket = Socket(receiverIpAddress, VIDEO_PORT)
-                    newSocket.tcpNoDelay = true
-                    val newOutput = DataOutputStream(newSocket.getOutputStream())
-
-                    synchronized(videoLock) {
-                        try { videoSocket?.close() } catch (_: Exception) {}
-                        videoSocket = newSocket
-                        videoOutput = newOutput
-                    }
-
-                    val sps = cachedSps
-                    val pps = cachedPps
-
-                    if (sps != null && pps != null) {
-                        writeVideoConfiguration(sps, pps)
-                    }
-
-                    videoReconnecting = false
-                    return@Thread
-
-                } catch (_: Exception) {
-                    try { Thread.sleep(RECONNECT_DELAY_MS) } catch (_: Exception) {}
-                }
-            }
-
-            videoReconnecting = false
-
-        }.start()
-    }
-
-    private fun attemptAudioReconnect() {
-
-        synchronized(audioLock) {
-            if (audioReconnecting) return
-            audioReconnecting = true
-        }
-
-        Thread {
-
-            while (running.get()) {
-
-                try {
-
-                    val newSocket = Socket(receiverIpAddress, AUDIO_PORT)
-                    newSocket.tcpNoDelay = true
-                    val newOutput = DataOutputStream(newSocket.getOutputStream())
-
-                    synchronized(audioLock) {
-                        try { audioSocket?.close() } catch (_: Exception) {}
-                        audioSocket = newSocket
-                        audioOutput = newOutput
-                    }
-
-                    val csd0 = cachedAudioCsd0
-
-                    if (csd0 != null && cachedAudioSampleRate > 0) {
-                        writeAudioConfiguration(
-                            cachedAudioSampleRate,
-                            cachedAudioChannelCount,
-                            csd0
-                        )
-                    }
-
-                    audioReconnecting = false
-                    return@Thread
-
-                } catch (_: Exception) {
-                    try { Thread.sleep(RECONNECT_DELAY_MS) } catch (_: Exception) {}
-                }
-            }
-
-            audioReconnecting = false
-
-        }.start()
+        audioFrameCounter++
+        sendFragmented(
+            socket,
+            AUDIO_PORT,
+            TYPE_AUDIO_CONFIG,
+            audioFrameCounter,
+            0,
+            0L,
+            payload.array()
+        )
     }
 
     private fun stopStreaming() {
@@ -777,10 +731,7 @@ class ScreenCaptureService : Service() {
         try { audioEncoder?.stop() } catch (_: Exception) {}
         try { audioEncoder?.release() } catch (_: Exception) {}
 
-        try { videoOutput?.close() } catch (_: Exception) {}
         try { videoSocket?.close() } catch (_: Exception) {}
-
-        try { audioOutput?.close() } catch (_: Exception) {}
         try { audioSocket?.close() } catch (_: Exception) {}
 
         virtualDisplay = null
@@ -789,9 +740,7 @@ class ScreenCaptureService : Service() {
         inputSurface = null
         audioRecord = null
         audioEncoder = null
-        videoOutput = null
         videoSocket = null
-        audioOutput = null
         audioSocket = null
 
         stopSelf()
