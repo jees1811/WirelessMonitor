@@ -5,14 +5,11 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Surface
-import java.io.BufferedInputStream
-import java.io.DataInputStream
-import java.net.ServerSocket
-import java.net.Socket
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -26,16 +23,20 @@ class VideoReceiver(
         const val VIDEO_PORT = 5000
         const val AUDIO_PORT = 5001
 
-        private const val PACKET_VIDEO_CONFIG = 0
-        private const val PACKET_VIDEO_FRAME = 1
-        private const val PACKET_AUDIO_CONFIG = 2
-        private const val PACKET_AUDIO_FRAME = 3
+        private const val TYPE_VIDEO_CONFIG = 10
+        private const val TYPE_VIDEO_FRAME = 11
+        private const val TYPE_AUDIO_CONFIG = 20
+        private const val TYPE_AUDIO_FRAME = 21
 
-        private const val MAX_PACKET_SIZE = 8 * 1024 * 1024
+        private const val HEADER_SIZE = 32
+        private const val RECEIVE_BUFFER_SIZE = 2048
+        private const val MAX_ASSEMBLED_SIZE = 8 * 1024 * 1024
+
+        private const val STALE_TIMEOUT_MS = 3000L
     }
 
-    private var videoServerSocket: ServerSocket? = null
-    private var audioServerSocket: ServerSocket? = null
+    private var videoSocket: DatagramSocket? = null
+    private var audioSocket: DatagramSocket? = null
 
     private var videoDecoder: MediaCodec? = null
     private var audioDecoder: MediaCodec? = null
@@ -45,8 +46,22 @@ class VideoReceiver(
 
     private var videoWorker: Thread? = null
     private var audioWorker: Thread? = null
+    private var watchdogWorker: Thread? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    @Volatile private var lastVideoPacketTime = 0L
+    @Volatile private var videoConnected = false
+
+    private var currentVideoFrameId = -1
+    private var currentVideoFragments: Array<ByteArray?>? = null
+    private var currentVideoFragmentsReceived = 0
+    private var currentVideoTotalSize = 0
+
+    private var currentAudioFrameId = -1
+    private var currentAudioFragments: Array<ByteArray?>? = null
+    private var currentAudioFragmentsReceived = 0
+    private var currentAudioTotalSize = 0
 
     fun start() {
 
@@ -59,43 +74,62 @@ class VideoReceiver(
 
         audioWorker = Thread { runAudioReceiver() }
         audioWorker?.start()
+
+        watchdogWorker = Thread { runWatchdog() }
+        watchdogWorker?.start()
+    }
+
+    private fun runWatchdog() {
+
+        while (running.get()) {
+
+            try { Thread.sleep(500) } catch (_: Exception) { break }
+
+            if (
+                videoConnected &&
+                System.currentTimeMillis() - lastVideoPacketTime > STALE_TIMEOUT_MS
+            ) {
+                videoConnected = false
+                mainHandler.post {
+                    onStatus("Waiting for the OnePlus 13 to connect...")
+                }
+            }
+        }
     }
 
     private fun runVideoReceiver() {
 
         try {
 
-            videoServerSocket = ServerSocket(VIDEO_PORT)
+            videoSocket = DatagramSocket(VIDEO_PORT)
+
+            mainHandler.post {
+                onStatus("Waiting for the OnePlus 13 to connect...")
+            }
+
+            val buffer = ByteArray(RECEIVE_BUFFER_SIZE)
 
             while (running.get()) {
 
-                mainHandler.post {
-                    onStatus("Waiting for the OnePlus 13 to connect...")
-                }
+                val packet = DatagramPacket(buffer, buffer.size)
 
-                val incoming = try {
-                    videoServerSocket!!.accept()
+                try {
+                    videoSocket!!.receive(packet)
                 } catch (_: Exception) {
                     break
                 }
 
-                incoming.tcpNoDelay = true
+                lastVideoPacketTime = System.currentTimeMillis()
 
-                mainHandler.post {
-                    onStatus("Connected - waiting for video...")
+                if (!videoConnected) {
+                    videoConnected = true
+                    mainHandler.post { onStatus("Connected") }
                 }
 
-                handleVideoConnection(incoming)
-
-                if (running.get()) {
-                    mainHandler.post {
-                        onStatus("Disconnected - waiting to reconnect...")
-                    }
+                try {
+                    handleVideoPacket(packet.data, packet.length)
+                } catch (_: Exception) {
                 }
-
-                try { videoDecoder?.stop() } catch (_: Exception) {}
-                try { videoDecoder?.release() } catch (_: Exception) {}
-                videoDecoder = null
             }
 
         } catch (e: Exception) {
@@ -106,73 +140,83 @@ class VideoReceiver(
 
         } finally {
 
-            try { videoServerSocket?.close() } catch (_: Exception) {}
+            try { videoSocket?.close() } catch (_: Exception) {}
         }
     }
 
-    private fun handleVideoConnection(socket: Socket) {
+    private fun handleVideoPacket(data: ByteArray, length: Int) {
 
-        try {
+        if (length < HEADER_SIZE) return
 
-            val input =
-                DataInputStream(
-                    BufferedInputStream(socket.getInputStream(), 1024 * 1024)
-                )
+        val header = ByteBuffer.wrap(data, 0, HEADER_SIZE)
+        val type = header.int
+        val frameId = header.int
+        val fragmentIndex = header.int
+        val fragmentCount = header.int
+        val flags = header.int
+        val pts = header.long
+        val totalSize = header.int
 
-            while (running.get()) {
+        if (totalSize <= 0 || totalSize > MAX_ASSEMBLED_SIZE) return
+        if (fragmentCount <= 0 || fragmentIndex < 0 || fragmentIndex >= fragmentCount) return
 
-                when (val packetType = input.readInt()) {
-                    PACKET_VIDEO_CONFIG -> handleVideoConfig(input)
-                    PACKET_VIDEO_FRAME -> handleVideoFrame(input)
-                    else -> throw Exception("Unexpected packet type $packetType on video connection")
-                }
-            }
+        val payloadLength = length - HEADER_SIZE
+        if (payloadLength <= 0) return
 
-        } catch (_: Exception) {
+        if (currentVideoFrameId != frameId) {
+            currentVideoFrameId = frameId
+            currentVideoFragments = arrayOfNulls(fragmentCount)
+            currentVideoFragmentsReceived = 0
+            currentVideoTotalSize = totalSize
+        }
 
-        } finally {
+        val fragments = currentVideoFragments ?: return
+        if (fragmentIndex >= fragments.size) return
 
-            try { socket.close() } catch (_: Exception) {}
+        if (fragments[fragmentIndex] == null) {
+            val payload = ByteArray(payloadLength)
+            System.arraycopy(data, HEADER_SIZE, payload, 0, payloadLength)
+            fragments[fragmentIndex] = payload
+            currentVideoFragmentsReceived++
+        }
+
+        if (currentVideoFragmentsReceived != fragments.size) return
+
+        val complete = ByteArray(currentVideoTotalSize)
+        var offset = 0
+        for (fragment in fragments) {
+            if (fragment == null) return
+            System.arraycopy(fragment, 0, complete, offset, fragment.size)
+            offset += fragment.size
+        }
+
+        currentVideoFrameId = -1
+        currentVideoFragments = null
+
+        when (type) {
+            TYPE_VIDEO_CONFIG -> processVideoConfig(complete)
+            TYPE_VIDEO_FRAME -> processVideoFrame(complete, flags, pts)
         }
     }
 
-    private fun handleVideoConfig(input: DataInputStream) {
+    private fun processVideoConfig(data: ByteArray) {
 
-        val videoWidth = input.readInt()
-        val videoHeight = input.readInt()
+        val buffer = ByteBuffer.wrap(data)
 
-        if (videoWidth <= 0 || videoHeight <= 0) {
-            throw Exception("Invalid video size")
-        }
+        val videoWidth = buffer.int
+        val videoHeight = buffer.int
 
-        val configSize = input.readInt()
+        if (videoWidth <= 0 || videoHeight <= 0) return
 
-        if (configSize <= 0 || configSize > MAX_PACKET_SIZE) {
-            throw Exception("Invalid codec configuration")
-        }
-
-        val config = ByteArray(configSize)
-        input.readFully(config)
-
-        val configBuffer = ByteBuffer.wrap(config)
-
-        val spsLength = configBuffer.int
-
-        if (spsLength <= 0 || spsLength > configBuffer.remaining()) {
-            throw Exception("Invalid SPS")
-        }
-
+        val spsLength = buffer.int
+        if (spsLength <= 0 || spsLength > buffer.remaining()) return
         val sps = ByteArray(spsLength)
-        configBuffer.get(sps)
+        buffer.get(sps)
 
-        val ppsLength = configBuffer.int
-
-        if (ppsLength <= 0 || ppsLength > configBuffer.remaining()) {
-            throw Exception("Invalid PPS")
-        }
-
+        val ppsLength = buffer.int
+        if (ppsLength <= 0 || ppsLength > buffer.remaining()) return
         val pps = ByteArray(ppsLength)
-        configBuffer.get(pps)
+        buffer.get(pps)
 
         val format =
             MediaFormat.createVideoFormat(
@@ -183,13 +227,6 @@ class VideoReceiver(
 
         format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
         format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            } catch (_: Exception) {
-            }
-        }
 
         try { videoDecoder?.stop() } catch (_: Exception) {}
         try { videoDecoder?.release() } catch (_: Exception) {}
@@ -202,22 +239,10 @@ class VideoReceiver(
 
         mainHandler.post {
             onVideoSize(videoWidth, videoHeight)
-            onStatus("Connected")
         }
     }
 
-    private fun handleVideoFrame(input: DataInputStream) {
-
-        val size = input.readInt()
-        val flags = input.readInt()
-        val presentationTimeUs = input.readLong()
-
-        if (size <= 0 || size > MAX_PACKET_SIZE) {
-            throw Exception("Invalid video frame")
-        }
-
-        val data = ByteArray(size)
-        input.readFully(data)
+    private fun processVideoFrame(data: ByteArray, flags: Int, presentationTimeUs: Long) {
 
         val codec = videoDecoder ?: return
 
@@ -247,52 +272,23 @@ class VideoReceiver(
 
         try {
 
-            audioServerSocket = ServerSocket(AUDIO_PORT)
+            audioSocket = DatagramSocket(AUDIO_PORT)
+
+            val buffer = ByteArray(RECEIVE_BUFFER_SIZE)
 
             while (running.get()) {
 
-                val incoming = try {
-                    audioServerSocket!!.accept()
+                val packet = DatagramPacket(buffer, buffer.size)
+
+                try {
+                    audioSocket!!.receive(packet)
                 } catch (_: Exception) {
                     break
                 }
 
-                incoming.tcpNoDelay = true
-
-                handleAudioConnection(incoming)
-
-                try { audioDecoder?.stop() } catch (_: Exception) {}
-                try { audioDecoder?.release() } catch (_: Exception) {}
-                audioDecoder = null
-
-                try { audioTrack?.stop() } catch (_: Exception) {}
-                try { audioTrack?.release() } catch (_: Exception) {}
-                audioTrack = null
-            }
-
-        } catch (_: Exception) {
-
-        } finally {
-
-            try { audioServerSocket?.close() } catch (_: Exception) {}
-        }
-    }
-
-    private fun handleAudioConnection(socket: Socket) {
-
-        try {
-
-            val input =
-                DataInputStream(
-                    BufferedInputStream(socket.getInputStream(), 128 * 1024)
-                )
-
-            while (running.get()) {
-
-                when (val packetType = input.readInt()) {
-                    PACKET_AUDIO_CONFIG -> handleAudioConfig(input)
-                    PACKET_AUDIO_FRAME -> handleAudioFrame(input)
-                    else -> throw Exception("Unexpected packet type $packetType on audio connection")
+                try {
+                    handleAudioPacket(packet.data, packet.length)
+                } catch (_: Exception) {
                 }
             }
 
@@ -300,23 +296,77 @@ class VideoReceiver(
 
         } finally {
 
-            try { socket.close() } catch (_: Exception) {}
+            try { audioSocket?.close() } catch (_: Exception) {}
         }
     }
 
-    private fun handleAudioConfig(input: DataInputStream) {
+    private fun handleAudioPacket(data: ByteArray, length: Int) {
 
-        val sampleRate = input.readInt()
-        val channelCount = input.readInt()
+        if (length < HEADER_SIZE) return
 
-        val csd0Size = input.readInt()
+        val header = ByteBuffer.wrap(data, 0, HEADER_SIZE)
+        val type = header.int
+        val frameId = header.int
+        val fragmentIndex = header.int
+        val fragmentCount = header.int
+        header.int
+        val pts = header.long
+        val totalSize = header.int
 
-        if (csd0Size < 0 || csd0Size > MAX_PACKET_SIZE) {
-            throw Exception("Invalid audio configuration")
+        if (totalSize <= 0 || totalSize > MAX_ASSEMBLED_SIZE) return
+        if (fragmentCount <= 0 || fragmentIndex < 0 || fragmentIndex >= fragmentCount) return
+
+        val payloadLength = length - HEADER_SIZE
+        if (payloadLength <= 0) return
+
+        if (currentAudioFrameId != frameId) {
+            currentAudioFrameId = frameId
+            currentAudioFragments = arrayOfNulls(fragmentCount)
+            currentAudioFragmentsReceived = 0
+            currentAudioTotalSize = totalSize
         }
 
+        val fragments = currentAudioFragments ?: return
+        if (fragmentIndex >= fragments.size) return
+
+        if (fragments[fragmentIndex] == null) {
+            val payload = ByteArray(payloadLength)
+            System.arraycopy(data, HEADER_SIZE, payload, 0, payloadLength)
+            fragments[fragmentIndex] = payload
+            currentAudioFragmentsReceived++
+        }
+
+        if (currentAudioFragmentsReceived != fragments.size) return
+
+        val complete = ByteArray(currentAudioTotalSize)
+        var offset = 0
+        for (fragment in fragments) {
+            if (fragment == null) return
+            System.arraycopy(fragment, 0, complete, offset, fragment.size)
+            offset += fragment.size
+        }
+
+        currentAudioFrameId = -1
+        currentAudioFragments = null
+
+        when (type) {
+            TYPE_AUDIO_CONFIG -> processAudioConfig(complete)
+            TYPE_AUDIO_FRAME -> processAudioFrame(complete, pts)
+        }
+    }
+
+    private fun processAudioConfig(data: ByteArray) {
+
+        val buffer = ByteBuffer.wrap(data)
+
+        val sampleRate = buffer.int
+        val channelCount = buffer.int
+        val csd0Size = buffer.int
+
+        if (csd0Size < 0 || csd0Size > buffer.remaining()) return
+
         val csd0 = ByteArray(csd0Size)
-        if (csd0Size > 0) input.readFully(csd0)
+        if (csd0Size > 0) buffer.get(csd0)
 
         val format =
             MediaFormat.createAudioFormat(
@@ -369,24 +419,14 @@ class VideoReceiver(
                         .setChannelMask(channelConfig)
                         .build()
                 )
-                .setBufferSizeInBytes(minBufferSize)
+                .setBufferSizeInBytes(minBufferSize * 2)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
         audioTrack!!.play()
     }
 
-    private fun handleAudioFrame(input: DataInputStream) {
-
-        val size = input.readInt()
-        val presentationTimeUs = input.readLong()
-
-        if (size <= 0 || size > MAX_PACKET_SIZE) {
-            throw Exception("Invalid audio frame")
-        }
-
-        val data = ByteArray(size)
-        input.readFully(data)
+    private fun processAudioFrame(data: ByteArray, presentationTimeUs: Long) {
 
         val codec = audioDecoder ?: return
 
@@ -415,7 +455,7 @@ class VideoReceiver(
                 outputBuffer.position(bufferInfo.offset)
                 outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
                 outputBuffer.get(pcm)
-                audioTrack?.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
+                audioTrack?.write(pcm, 0, pcm.size)
             }
 
             codec.releaseOutputBuffer(outputIndex, false)
@@ -427,8 +467,8 @@ class VideoReceiver(
 
         running.set(false)
 
-        try { videoServerSocket?.close() } catch (_: Exception) {}
-        try { audioServerSocket?.close() } catch (_: Exception) {}
+        try { videoSocket?.close() } catch (_: Exception) {}
+        try { audioSocket?.close() } catch (_: Exception) {}
 
         try { videoDecoder?.stop() } catch (_: Exception) {}
         try { videoDecoder?.release() } catch (_: Exception) {}
