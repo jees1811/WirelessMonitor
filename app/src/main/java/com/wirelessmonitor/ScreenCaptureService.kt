@@ -296,7 +296,11 @@ class ScreenCaptureService : Service() {
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, 2130708361)
         format.setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
         format.setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                try {
+            format.setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, 0.5f)
+        } catch (_: Exception) {
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
 
         videoEncoder =
             MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -409,14 +413,15 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    private fun sendFragmented(
+        private fun sendFragmented(
         socket: DatagramSocket,
         port: Int,
         type: Int,
         frameId: Int,
         flags: Int,
         presentationTimeUs: Long,
-        data: ByteArray
+        data: ByteArray,
+        redundant: Boolean = false
     ) {
 
         val address = receiverAddress ?: return
@@ -441,15 +446,23 @@ class ScreenCaptureService : Service() {
             buffer.putInt(data.size)
             buffer.put(data, start, chunkSize)
 
+            val packetBytes = buffer.array()
+
             try {
-                val packet = DatagramPacket(
-                    buffer.array(),
-                    buffer.array().size,
-                    address,
-                    port
-                )
-                socket.send(packet)
+                socket.send(DatagramPacket(packetBytes, packetBytes.size, address, port))
             } catch (_: Exception) {
+            }
+
+            if (fragmentIndex % 6 == 5) {
+                try { Thread.sleep(1) } catch (_: Exception) {}
+            }
+
+            if (redundant) {
+                try { Thread.sleep(2) } catch (_: Exception) {}
+                try {
+                    socket.send(DatagramPacket(packetBytes, packetBytes.size, address, port))
+                } catch (_: Exception) {
+                }
             }
         }
     }
@@ -509,7 +522,8 @@ class ScreenCaptureService : Service() {
                     videoFrameCounter,
                     info.flags,
                     info.presentationTimeUs,
-                    data
+                    data,
+                    redundant = isKeyFrame
                 )
             }
 
@@ -657,7 +671,8 @@ class ScreenCaptureService : Service() {
             videoFrameCounter,
             0,
             0L,
-            payload.array()
+            payload.array(),
+            redundant = true
         )
     }
 
