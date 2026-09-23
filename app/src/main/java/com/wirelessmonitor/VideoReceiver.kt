@@ -58,6 +58,8 @@ class VideoReceiver(
     private var currentVideoFragmentsReceived = 0
     private var currentVideoTotalSize = 0
 
+    private var waitingForKeyframe = true
+
     private var currentAudioFrameId = -1
     private var currentAudioFragments: Array<ByteArray?>? = null
     private var currentAudioFragmentsReceived = 0
@@ -102,6 +104,11 @@ class VideoReceiver(
         try {
 
             videoSocket = DatagramSocket(VIDEO_PORT)
+
+            try {
+                videoSocket!!.receiveBufferSize = 1024 * 1024
+            } catch (_: Exception) {
+            }
 
             mainHandler.post {
                 onStatus("Waiting for the OnePlus 13 to connect...")
@@ -164,6 +171,15 @@ class VideoReceiver(
         if (payloadLength <= 0) return
 
         if (currentVideoFrameId != frameId) {
+
+            val previousFragments = currentVideoFragments
+            if (
+                previousFragments != null &&
+                currentVideoFragmentsReceived < previousFragments.size
+            ) {
+                waitingForKeyframe = true
+            }
+
             currentVideoFrameId = frameId
             currentVideoFragments = arrayOfNulls(fragmentCount)
             currentVideoFragmentsReceived = 0
@@ -195,7 +211,19 @@ class VideoReceiver(
 
         when (type) {
             TYPE_VIDEO_CONFIG -> processVideoConfig(complete)
-            TYPE_VIDEO_FRAME -> processVideoFrame(complete, flags, pts)
+            TYPE_VIDEO_FRAME -> {
+
+                val isKeyFrame = (flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+                if (waitingForKeyframe) {
+                    if (isKeyFrame) {
+                        waitingForKeyframe = false
+                        processVideoFrame(complete, flags, pts)
+                    }
+                } else {
+                    processVideoFrame(complete, flags, pts)
+                }
+            }
         }
     }
 
@@ -237,6 +265,8 @@ class VideoReceiver(
         videoDecoder!!.configure(format, surface, null, 0)
         videoDecoder!!.start()
 
+        waitingForKeyframe = true
+
         mainHandler.post {
             onVideoSize(videoWidth, videoHeight)
         }
@@ -273,6 +303,11 @@ class VideoReceiver(
         try {
 
             audioSocket = DatagramSocket(AUDIO_PORT)
+
+            try {
+                audioSocket!!.receiveBufferSize = 256 * 1024
+            } catch (_: Exception) {
+            }
 
             val buffer = ByteArray(RECEIVE_BUFFER_SIZE)
 
