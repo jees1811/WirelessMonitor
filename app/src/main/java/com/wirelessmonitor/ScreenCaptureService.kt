@@ -209,8 +209,18 @@ class ScreenCaptureService : Service() {
 
             receiverAddress = InetAddress.getByName(receiverIp)
 
-            videoSocket = DatagramSocket()
+                        videoSocket = DatagramSocket()
             audioSocket = DatagramSocket()
+
+            try {
+                videoSocket!!.sendBufferSize = 1024 * 1024
+            } catch (_: Exception) {
+            }
+
+            try {
+                audioSocket!!.sendBufferSize = 256 * 1024
+            } catch (_: Exception) {
+            }
 
             running.set(true)
 
